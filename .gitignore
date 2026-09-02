@@ -2,8 +2,16 @@ payload/
 *.tar.gz
 *.tar.gz.enc.tmp
 
+# Platform binaries must only be added after encryption.  Keep accidental
+# plaintext copies out of the index while allowing the encrypted artifacts.
+fpro-client_*
+fpro-server_*
+!fpro-client_*.enc
+!fpro-server_*.enc
+
 # Never track deployment credentials or local bridge state in plaintext.
 *.key
 *.pem
 auth-token
 .bridge_env.json
+.bridge_env.*

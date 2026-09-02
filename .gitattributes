@@ -1,0 +1,8 @@
+# Keep executable scripts portable across Windows and Linux checkouts.
+*.sh text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+
+# Encrypted payloads are opaque binary artifacts; never normalize line endings
+# or render them as text diffs.
+*.enc binary

@@ -6,10 +6,10 @@
 #   1) 提示输入压缩包解压密码（密码错误则拒绝继续，不会落地任何文件）
 #   2) 解密并解包加密压缩包（AES-256-CBC + PBKDF2）
 #   3) 结束此前部署的全部 fpro-client 进程（精确匹配，避免误杀自身）
-#   4) 安装 fpro-client 二进制、证书、auth-token、客户端配置
+#   4) 按当前 Linux 架构下载并解密对应的 fpro-client 二进制，安装证书与配置
 #   5) 配置并拉起 sshd（root 密钥登录，关闭密码登录）
-#   6) 拉起看门狗，自动上线到 [REDACTED_HOST]:7022
-#   7) 自检隧道是否打通
+#   6) 拉起看门狗，按加密配置连接服务端
+#   7) 从加密配置读取映射地址并自检隧道
 #
 #  使用（容器重启后）：
 #    bash install.sh            # 默认读取同目录下的 fpro-deploy.tar.gz.enc
@@ -31,12 +31,101 @@ PKG_NAME="fpro-deploy.tar.gz.enc"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PKG_INPUT="${PKG_URL:-$DIR/$PKG_NAME}"
 
+die() {
+    echo "[-] $*" >&2
+    exit 1
+}
+
+download_artifact() {
+    local source="$1"
+    local dest="$2"
+    if [[ "$source" == https://* ]]; then
+        if command -v curl >/dev/null 2>&1; then
+            curl --fail --location --silent --show-error --proto '=https' \
+                --tlsv1.2 "$source" -o "$dest"
+        elif command -v wget >/dev/null 2>&1; then
+            wget --https-only --quiet -O "$dest" "$source"
+        else
+            die "从 HTTPS 下载文件需要 curl 或 wget。"
+        fi
+    elif [[ "$source" == *://* ]]; then
+        die "只支持本地路径或 HTTPS URL：$source"
+    else
+        [ -f "$source" ] || die "找不到文件：$source"
+        cp "$source" "$dest"
+    fi
+}
+
+detect_client_binary() {
+    local os arch
+    os="$(uname -s)"
+    arch="$(uname -m)"
+    [ "$os" = "Linux" ] || die "当前安装脚本只支持 Linux，检测到：$os"
+    case "$arch" in
+        x86_64|amd64) echo "fpro-client_linux_amd64.b64" ;;
+        aarch64|arm64) echo "fpro-client_linux_arm64.b64" ;;
+        armv5*|armv6*|arm5*) echo "fpro-client_linux_arm_armv5.b64" ;;
+        armv7*|armhf|arm) echo "fpro-client_linux_arm_armv7.b64" ;;
+        loongarch64) echo "fpro-client_linux_loong64.b64" ;;
+        riscv64) echo "fpro-client_linux_riscv64.b64" ;;
+        mips64el|mips64le) echo "fpro-client_linux_mips64le.b64" ;;
+        mips64) echo "fpro-client_linux_mips64.b64" ;;
+        mipsel) echo "fpro-client_linux_mipsle_softfloat.b64" ;;
+        mips) echo "fpro-client_linux_mips_softfloat.b64" ;;
+        *) die "没有适配当前 Linux 架构 ($arch) 的 fpro-client。可用 FPRO_BINARY_NAME 手动指定。" ;;
+    esac
+}
+
+resolve_binary_source() {
+    local pkg_no_query pkg_dir
+    if [ -n "${FPRO_BINARY_URL:-}" ]; then
+        printf '%s\n' "$FPRO_BINARY_URL"
+    elif [ -n "${BINARY_BASE_URL:-}" ]; then
+        printf '%s/%s\n' "${BINARY_BASE_URL%/}" "$BINARY_ENC_NAME"
+    elif [[ "$PKG_INPUT" == https://* ]]; then
+        pkg_no_query="${PKG_INPUT%%\?*}"
+        printf '%s/%s\n' "${pkg_no_query%/*}" "$BINARY_ENC_NAME"
+    else
+        pkg_dir="$(dirname "$PKG_INPUT")"
+        printf '%s/%s\n' "$pkg_dir" "$BINARY_ENC_NAME"
+    fi
+}
+
+read_toml_scalar() {
+    local key="$1"
+    local file="$2"
+    local line value
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*${key}[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            value="${BASH_REMATCH[1]}"
+            value="${value%%#*}"
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+            if [[ "$value" == \"*\" ]]; then
+                value="${value#\"}"
+                value="${value%%\"*}"
+            fi
+            printf '%s\n' "$value"
+            return 0
+        fi
+    done < "$file"
+    return 1
+}
+
+CLIENT_PLAIN_NAME="${FPRO_BINARY_NAME:-$(detect_client_binary)}"
+if [[ "$CLIENT_PLAIN_NAME" == *.enc ]]; then
+    CLIENT_PLAIN_NAME="${CLIENT_PLAIN_NAME%.enc}"
+fi
+[[ "$CLIENT_PLAIN_NAME" == fpro-client_* ]] || die "FPRO_BINARY_NAME 必须是 fpro-client 平台文件名。"
+[[ "$CLIENT_PLAIN_NAME" != */* ]] || die "FPRO_BINARY_NAME 不得包含目录路径。"
+BINARY_ENC_NAME="${CLIENT_PLAIN_NAME}.enc"
+
 # ---- 0. 权限 & 依赖检查 ----------------------------------------------------
 if [ "$(id -u)" -ne 0 ]; then
     echo "[-] 请用 root 运行： sudo bash install.sh" >&2
     exit 1
 fi
-for c in openssl tar mktemp; do
+for c in openssl tar mktemp base64 uname; do
     command -v "$c" >/dev/null 2>&1 || { echo "[-] 缺少依赖: $c" >&2; exit 1; }
 done
 
@@ -46,28 +135,8 @@ cleanup() { rm -rf -- "$TMP" 2>/dev/null || true; }
 trap cleanup EXIT
 
 # PKG_URL 支持 HTTPS 下载；未设置时读取脚本同目录的本地文件。
-if [[ "$PKG_INPUT" == https://* ]]; then
-    PKG="$TMP/$PKG_NAME"
-    if command -v curl >/dev/null 2>&1; then
-        curl --fail --location --silent --show-error --proto '=https' \
-            --tlsv1.2 "$PKG_INPUT" -o "$PKG"
-    elif command -v wget >/dev/null 2>&1; then
-        wget --https-only --quiet -O "$PKG" "$PKG_INPUT"
-    else
-        echo "[-] 使用 PKG_URL 时需要 curl 或 wget。" >&2
-        exit 1
-    fi
-elif [[ "$PKG_INPUT" == *://* ]]; then
-    echo "[-] PKG_URL 只支持 HTTPS URL。" >&2
-    exit 1
-else
-    PKG="$PKG_INPUT"
-    if [ ! -f "$PKG" ]; then
-        echo "[-] 找不到加密压缩包: $PKG" >&2
-        echo "    请把 install.sh 与 $PKG_NAME 放在同一目录，或用 PKG_URL 指定 HTTPS 地址。" >&2
-        exit 1
-    fi
-fi
+PKG="$TMP/$PKG_NAME"
+download_artifact "$PKG_INPUT" "$PKG"
 
 # ---- 1. 输入密码 ----------------------------------------------------------
 echo "=========================================================="
@@ -100,7 +169,6 @@ else
     PAY="$TMP"
 fi
 required_files=(
-    "bin/fpro-client_linux_amd64"
     "certs/ca.crt"
     "certs/client.crt"
     "certs/client.key"
@@ -116,6 +184,37 @@ for rel in "${required_files[@]}"; do
     fi
 done
 echo "[+] 解密成功，载荷已就绪。"
+
+# ---- 2b. 按架构获取独立加密二进制 ------------------------------------------
+# 新方案：每个平台文件单独以原文件名 + .enc 存放在仓库中。
+# 兼容旧包：若配置包仍携带 amd64 原始二进制，则仅在对应架构下回退使用。
+FPRO_BIN=""
+legacy_binary="$PAY/bin/fpro-client_linux_amd64"
+if [ -f "$legacy_binary" ] && [ "$CLIENT_PLAIN_NAME" = "fpro-client_linux_amd64.b64" ]; then
+    echo "[*] 检测到旧版载荷内置 amd64 二进制，兼容使用。"
+    FPRO_BIN="$legacy_binary"
+else
+    BINARY_SOURCE="$(resolve_binary_source)"
+    echo "[*] 获取架构二进制：$BINARY_ENC_NAME"
+    download_artifact "$BINARY_SOURCE" "$TMP/$BINARY_ENC_NAME"
+    CLIENT_PLAIN="$TMP/$CLIENT_PLAIN_NAME"
+    if ! printf '%s\n' "$PASS" | openssl enc -d -aes-256-cbc -pbkdf2 \
+            -in "$TMP/$BINARY_ENC_NAME" -out "$CLIENT_PLAIN" -pass stdin 2>/dev/null; then
+        echo "[-] 二进制解密失败：$BINARY_ENC_NAME（密码错误或文件损坏）。" >&2
+        exit 1
+    fi
+    if [[ "$CLIENT_PLAIN_NAME" == *.b64 ]]; then
+        FPRO_BIN="$TMP/fpro-client"
+        if ! base64 -d "$CLIENT_PLAIN" > "$FPRO_BIN" 2>/dev/null; then
+            echo "[-] 二进制 Base64 解码失败：$CLIENT_PLAIN_NAME" >&2
+            exit 1
+        fi
+    else
+        FPRO_BIN="$CLIENT_PLAIN"
+    fi
+fi
+[ -s "$FPRO_BIN" ] || die "架构二进制为空或不存在：$FPRO_BIN"
+unset PASS
 
 # ---- 3. 结束此前的 fpro-client 进程（精确匹配 /proc/<pid>/exe） -----------
 echo "[*] 清理既有 fpro-client 进程 ..."
@@ -134,7 +233,7 @@ sleep 1
 
 # ---- 4. 安装 fpro-client 二进制 / 证书 / 配置 ------------------------------
 echo "[*] 安装 fpro-client 二进制与证书 ..."
-install -m 0755 "$PAY/bin/fpro-client_linux_amd64" /usr/local/bin/fpro-client
+install -m 0755 "$FPRO_BIN" /usr/local/bin/fpro-client
 mkdir -p /opt/fpro-client/certs
 cp "$PAY/certs/ca.crt"     /opt/fpro-client/certs/ca.crt
 cp "$PAY/certs/client.crt" /opt/fpro-client/certs/client.crt
@@ -179,7 +278,7 @@ else
     echo "[+] sshd 已在运行"
 fi
 
-# ---- 6. 拉起看门狗（自动上线 220:7022） ------------------------------------
+# ---- 6. 拉起看门狗 ---------------------------------------------------------
 echo "[*] 启动 fpro-client 看门狗 ..."
 nohup /opt/fpro-client/watchdog.sh >>/var/log/fpro-watchdog.log 2>&1 &
 watchdog_pid=$!
@@ -198,17 +297,23 @@ else
     exit 1
 fi
 
-# 回环验证：容器 -> 220:7022 -> 容器:22
+# 回环验证所需的地址和端口从解密后的客户端配置读取，避免写入仓库明文。
+TUNNEL_HOST="${FPRO_TUNNEL_HOST:-$(read_toml_scalar serverAddr "$PAY/fpro-client.toml" || true)}"
+TUNNEL_PORT="${FPRO_TUNNEL_PORT:-$(read_toml_scalar remotePort "$PAY/fpro-client.toml" || true)}"
+[ -n "$TUNNEL_HOST" ] || die "无法从加密配置读取 serverAddr。"
+[[ "$TUNNEL_PORT" =~ ^[0-9]+$ ]] || die "无法从加密配置读取有效的 remotePort。"
+[[ "$TUNNEL_HOST" =~ ^[A-Za-z0-9._:-]+$ ]] || die "加密配置中的 serverAddr 格式无效。"
+
 if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=6 -o BatchMode=yes \
-       -p 7022 root@[REDACTED_HOST] 'echo TUNNEL_OK' 2>/dev/null | grep -q TUNNEL_OK; then
-    echo "[+] 隧道已打通：ssh -p 7022 root@[REDACTED_HOST] 可用"
+       -p "$TUNNEL_PORT" "root@$TUNNEL_HOST" 'echo TUNNEL_OK' 2>/dev/null | grep -q TUNNEL_OK; then
+    echo "[+] 隧道已打通：ssh -p $TUNNEL_PORT root@$TUNNEL_HOST 可用"
 else
     echo "[-] 隧道回环自检未通过（进程可能还在握手），请稍后重试：" >&2
-    echo "      ssh -p 7022 root@[REDACTED_HOST]"
+    echo "      ssh -p $TUNNEL_PORT root@$TUNNEL_HOST"
     exit 1
 fi
 
 echo "=========================================================="
 echo "  部署完成。"
-echo "  本机连接命令： ssh -p 7022 root@[REDACTED_HOST]"
+echo "  本机连接命令： ssh -p $TUNNEL_PORT root@$TUNNEL_HOST"
 echo "=========================================================="
