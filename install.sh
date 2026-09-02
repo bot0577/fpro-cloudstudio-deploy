@@ -14,7 +14,7 @@
 #  使用（容器重启后）：
 #    bash install.sh            # 默认读取同目录下的 fpro-deploy.tar.gz.enc
 #    或：
-#    PKG_URL=https://.../raw/.../fpro-deploy.tar.gz.enc bash install.sh
+#    sudo env PKG_URL=https://.../raw/.../fpro-deploy.tar.gz.enc bash install.sh
 # ============================================================================
 
 set -Eeuo pipefail
