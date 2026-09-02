@@ -54,6 +54,35 @@ sudo env \
 
 安装脚本兼容两种配置包结构：解包后直接出现 `certs/`、`ssh/` 等目录，或这些目录位于 `payload/` 子目录中。旧版仍携带 amd64 二进制时会兼容使用，但新包默认从独立加密文件获取二进制。
 
+### 只拉取当前架构文件
+
+仓库较大时可以使用 Git 部分克隆和稀疏检出，只下载当前 Linux 架构所需的客户端：
+
+```bash
+case "$(uname -m)" in
+  x86_64|amd64) name=fpro-client_linux_amd64.b64 ;;
+  aarch64|arm64) name=fpro-client_linux_arm64.b64 ;;
+  armv7*|armhf|arm) name=fpro-client_linux_arm_armv7.b64 ;;
+  armv5*|armv6*|arm5*) name=fpro-client_linux_arm_armv5.b64 ;;
+  loongarch64) name=fpro-client_linux_loong64.b64 ;;
+  riscv64) name=fpro-client_linux_riscv64.b64 ;;
+  mips64el|mips64le) name=fpro-client_linux_mips64le.b64 ;;
+  mips64) name=fpro-client_linux_mips64.b64 ;;
+  mipsel) name=fpro-client_linux_mipsle_softfloat.b64 ;;
+  mips) name=fpro-client_linux_mips_softfloat.b64 ;;
+  *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+git clone --filter=blob:none --no-checkout \
+  https://github.com/bot0577/fpro-cloudstudio-deploy.git fpro-deploy
+cd fpro-deploy
+git sparse-checkout init --cone
+git sparse-checkout set install.sh README.md fpro-deploy.tar.gz.enc "$name.enc"
+git checkout
+sudo bash install.sh
+```
+
+私有仓库的 Git 凭据由 Git 自身处理；不要把令牌写入 URL、脚本或配置文件。
+
 ## 配置载荷
 
 配置载荷包含：
