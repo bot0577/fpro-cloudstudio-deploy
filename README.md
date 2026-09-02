@@ -49,6 +49,10 @@ manifest.json                 元数据
    ```bash
    sudo bash install.sh
    ```
+   也可以从 HTTPS 地址取包：
+   ```bash
+   sudo env PKG_URL="https://<host>/<path>/fpro-deploy.tar.gz.enc" bash install.sh
+   ```
 3. 本机验证：
    ```bash
    ssh -p 7022 root@[REDACTED_HOST]
@@ -57,8 +61,11 @@ manifest.json                 元数据
 ## 安全说明
 - 压缩包 AES-256-CBC + PBKDF2，密码不落盘、不进命令行（走 stdin）。
 - `client.key` / `auth-token` 在容器内权限 600。
-- 仓库可以公开；切勿把 `payload/` 明文目录提交进库。
+- 仓库可以公开；Git 只提交加密的 `.enc` 文件，切勿把 `payload/`、私钥、auth token 或 bridge 配置以明文提交。
+- `payload/` 和本地 bridge 配置仅用于本机审计/连接，不属于部署仓库；如需备份敏感资料，应只放入加密载荷。
 - 改密码只需重新 `tar | openssl enc` 生成新的 `.enc` 并替换仓库文件。
+
+脚本兼容两种加密包目录结构：解包后直接出现 `bin/`、`certs/` 等目录，或这些目录位于 `payload/` 子目录中。
 
 ## 本地重新打包
 ```bash

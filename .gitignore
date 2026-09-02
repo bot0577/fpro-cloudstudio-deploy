@@ -1,3 +1,9 @@
 payload/
 *.tar.gz
 *.tar.gz.enc.tmp
+
+# Never track deployment credentials or local bridge state in plaintext.
+*.key
+*.pem
+auth-token
+.bridge_env.json
