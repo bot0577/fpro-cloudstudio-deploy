@@ -1,0 +1,3 @@
+payload/
+*.tar.gz
+*.tar.gz.enc.tmp
