@@ -12,9 +12,9 @@
 #   7) 从加密配置读取映射地址并自检隧道
 #
 #  使用（容器重启后）：
-#    bash install.sh            # 默认读取同目录下的 fpro-deploy.tar.gz.enc
-#    或：
-#    sudo env PKG_URL=https://.../raw/.../fpro-deploy.tar.gz.enc bash install.sh
+#    bash install.sh             # 本地文件存在时使用本地文件，否则从 GitHub Raw 下载
+#    curl -fsSL https://raw.githubusercontent.com/bot0577/fpro-cloudstudio-deploy/main/install.sh | sudo bash
+#    或通过 PKG_URL / BINARY_BASE_URL 覆盖默认下载地址
 # ============================================================================
 
 set -Eeuo pipefail
@@ -28,23 +28,49 @@ on_error() {
 trap on_error ERR
 
 PKG_NAME="fpro-deploy.tar.gz.enc"
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PKG_INPUT="${PKG_URL:-$DIR/$PKG_NAME}"
+RAW_BASE_URL="${FPRO_REPO_RAW_BASE_URL:-https://raw.githubusercontent.com/bot0577/fpro-cloudstudio-deploy/main}"
+RAW_BASE_URL="${RAW_BASE_URL%/}"
+SCRIPT_REF="${BASH_SOURCE[0]:-}"
+if [ -n "$SCRIPT_REF" ] && [ -f "$SCRIPT_REF" ]; then
+    DIR="$(cd "$(dirname "$SCRIPT_REF")" && pwd)"
+else
+    # curl | bash / bash <(curl ...) 没有可用的脚本目录；使用当前目录仅作本地回退。
+    DIR="$(pwd)"
+fi
+if [ -n "${PKG_URL:-}" ]; then
+    PKG_INPUT="$PKG_URL"
+elif [ -f "$DIR/$PKG_NAME" ]; then
+    PKG_INPUT="$DIR/$PKG_NAME"
+else
+    PKG_INPUT="$RAW_BASE_URL/$PKG_NAME"
+fi
 
 die() {
     echo "[-] $*" >&2
     exit 1
 }
 
+[[ "$RAW_BASE_URL" == https://* ]] || die "FPRO_REPO_RAW_BASE_URL 必须使用 HTTPS。"
+
 download_artifact() {
     local source="$1"
     local dest="$2"
+    local github_token="${FPRO_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
+    local -a auth_args=()
+    # 私有仓库可通过环境变量提供只读令牌；令牌不写入文件或 URL。
+    if [ -n "$github_token" ] && [[ "$source" == https://raw.githubusercontent.com/* ]]; then
+        auth_args=(--header "Authorization: Bearer $github_token")
+    fi
     if [[ "$source" == https://* ]]; then
         if command -v curl >/dev/null 2>&1; then
-            curl --fail --location --silent --show-error --proto '=https' \
-                --tlsv1.2 "$source" -o "$dest"
+            if ! curl --fail --location --silent --show-error --proto '=https' \
+                    --tlsv1.2 "${auth_args[@]}" "$source" -o "$dest"; then
+                die "下载失败：$source。私有 GitHub 仓库请配置 FPRO_GITHUB_TOKEN，或先进行稀疏克隆。"
+            fi
         elif command -v wget >/dev/null 2>&1; then
-            wget --https-only --quiet -O "$dest" "$source"
+            if ! wget --https-only --quiet "${auth_args[@]}" -O "$dest" "$source"; then
+                die "下载失败：$source。私有 GitHub 仓库请配置 FPRO_GITHUB_TOKEN，或先进行稀疏克隆。"
+            fi
         else
             die "从 HTTPS 下载文件需要 curl 或 wget。"
         fi
@@ -134,7 +160,7 @@ TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP" 2>/dev/null || true; }
 trap cleanup EXIT
 
-# PKG_URL 支持 HTTPS 下载；未设置时读取脚本同目录的本地文件。
+# PKG_URL 支持 HTTPS 下载；未设置时优先使用同目录文件，否则使用默认 GitHub Raw 地址。
 PKG="$TMP/$PKG_NAME"
 download_artifact "$PKG_INPUT" "$PKG"
 
@@ -142,7 +168,14 @@ download_artifact "$PKG_INPUT" "$PKG"
 echo "=========================================================="
 echo "  fpro 一键部署 — 请输入压缩包解压密码"
 echo "=========================================================="
-read -r -s -p "解压密码: " PASS
+if [ -t 0 ]; then
+    read -r -s -p "解压密码: " PASS
+elif [ -r /dev/tty ]; then
+    # 支持 curl | sudo bash：脚本内容占用 stdin，密码改从控制终端读取。
+    read -r -s -p "解压密码: " PASS < /dev/tty
+else
+    die "需要交互式终端输入解压密码；请在 TTY 中运行脚本。"
+fi
 echo
 if [ -z "$PASS" ]; then
     echo "[-] 密码为空，已取消。" >&2

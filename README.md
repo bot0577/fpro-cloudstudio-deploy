@@ -31,9 +31,19 @@ install.sh                             容器侧安装脚本
 sudo bash install.sh
 ```
 
+仓库允许匿名读取时，也可以直接从 GitHub Raw 执行；脚本会自动下载配置包和当前架构的客户端：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bot0577/fpro-cloudstudio-deploy/main/install.sh | sudo bash
+```
+
+当前仓库为私有仓库时，Raw 请求需要读取权限。推荐先使用 Git 凭据做稀疏克隆，或在运行环境中以环境变量提供只读的 `FPRO_GITHUB_TOKEN`；不要把令牌写进 URL、脚本或 Git 历史。
+
+如使用镜像或固定版本，可用 `FPRO_REPO_RAW_BASE_URL` 指定不含文件名的 HTTPS Raw 目录。
+
 脚本会读取 `uname -s` 和 `uname -m`，选择对应的 Linux 客户端文件，例如
 `x86_64` 使用 `fpro-client_linux_amd64.b64.enc`，`aarch64` 使用
-`fpro-client_linux_arm64.b64.enc`。默认情况下，二进制文件与脚本/配置包位于同一目录。
+`fpro-client_linux_arm64.b64.enc`。本地包和二进制存在时使用脚本同目录文件，否则自动使用默认 GitHub Raw 目录。
 
 也可以从 HTTPS 地址取配置包。若二进制文件位于同一远程目录，脚本会自动推导地址：
 
