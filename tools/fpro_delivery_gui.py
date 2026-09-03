@@ -58,8 +58,10 @@ CONFIG_ARTIFACT = "fpro-deploy.tar.gz.enc"
 MAX_CONFIG_BYTES = 512 * 1024 * 1024
 MAX_MEMBER_BYTES = 256 * 1024
 KEY_NAME_DEFAULT = "fpro-cloudstudio"
+KEY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,96}$")
 DEFAULT_TEMP_PORT_MIN = 7001
 DEFAULT_TEMP_PORT_MAX = 7499
+CDP_AUTO_WAIT_SECONDS = 30
 DEFAULT_CDP_ENDPOINTS = (
     "http://127.0.0.1:9222",
     "http://127.0.0.1:9333",
@@ -324,13 +326,19 @@ def config_values(config_path: pathlib.Path) -> dict[str, str]:
     return values
 
 
-def make_remote_command(raw_base: str, receiver_url: str) -> str:
+def make_remote_command(
+    raw_base: str,
+    receiver_url: str,
+    key_name: str = KEY_NAME_DEFAULT,
+) -> str:
     """Build a one-paste bootstrap command with two hidden prompts.
 
     The first prompt captures the package password into a temporary file; the
     second captures the one-shot receiver token.  Neither secret appears in
     shell history or the command text.
     """
+    if not KEY_NAME_RE.fullmatch(key_name):
+        raise AppError("SSH 密钥名只能包含字母、数字、点、下划线和连字符。")
     install_url = normalize_raw_base(raw_base) + "/install.sh"
     fetch_script = (
         f"if command -v curl >/dev/null 2>&1; then curl -fsSL {shell_quote(install_url)}; "
@@ -348,6 +356,7 @@ def make_remote_command(raw_base: str, receiver_url: str) -> str:
         f"{fetch_script} | sudo env "
         "FPRO_PACKAGE_PASSWORD_FILE=/tmp/fpro-package-password "
         "FPRO_SSH_GENERATE=1 "
+        f"FPRO_SSH_KEY_NAME={shell_quote(key_name)} "
         f"FPRO_SSH_RECEIVER_URL={shell_quote(receiver_url)} "
         "FPRO_SSH_RECEIVER_TOKEN_FILE=/tmp/fpro-receiver-token "
         "FPRO_SSH_RECEIVER_TIMEOUT=90 bash; "
@@ -370,6 +379,7 @@ class PreparedAssets:
     server_port: int
     tls_server_name: str
     fpro_user: str
+    key_name: str
     ssh_port: Optional[int]
     remote_port: int
     raw_base: str
@@ -450,15 +460,11 @@ class DeliveryApp(tk.Tk):
         form = ttk.LabelFrame(outer, text="部署参数", padding=10)
         form.pack(fill="x")
         self.add_row(form, 0, "配置包密码（不保存）", "password", None)
-        self.add_row(
+        ttk.Label(
             form,
-            1,
-            "临时远端端口（可留空）",
-            "entry",
-            self.temp_port_var,
-            hint="留空自动选择；仅在自定义服务端时填写",
-        )
-        self.add_row(form, 2, "Cloud Studio 自动执行", "check", self.auto_cdp_var, hint="检测到本机 Chrome CDP 时自动输入命令")
+            text="临时端口、浏览器自动输入等已自动处理；通常无需修改高级设置。",
+            foreground="#777777",
+        ).grid(row=1, column=1, sticky="w", pady=(2, 0))
 
         self.advanced_toggle = ttk.Button(
             outer,
@@ -468,15 +474,31 @@ class DeliveryApp(tk.Tk):
         self.advanced_toggle.pack(anchor="w", pady=(10, 0))
         advanced = ttk.LabelFrame(outer, text="高级设置", padding=10)
         self.advanced_frame = advanced
-        self.add_row(advanced, 0, "本地仓库目录", "browse", self.repo_var, self.browse_repo)
-        self.add_row(advanced, 1, "本机 fpro-client.exe", "browse", self.binary_var, self.browse_binary)
-        self.add_row(advanced, 2, "服务端地址覆盖", "entry", self.server_var, hint="留空则从加密配置读取")
-        self.add_row(advanced, 3, "控制端口覆盖", "entry", self.server_port_var, hint="留空则从加密配置读取")
-        self.add_row(advanced, 4, "TLS Server Name 覆盖", "entry", self.tls_name_var, hint="留空则从加密配置读取")
-        self.add_row(advanced, 5, "SSH 私钥目录", "entry", self.ssh_dir_var)
-        self.add_row(advanced, 6, "SSH 密钥名", "entry", self.key_name_var)
-        self.add_row(advanced, 7, "Chrome CDP 地址", "entry", self.cdp_var)
-        self.add_row(advanced, 8, "Raw 基础地址", "entry", self.raw_var)
+        self.add_row(
+            advanced,
+            0,
+            "临时远端端口（可留空）",
+            "entry",
+            self.temp_port_var,
+            hint="留空自动选择；仅在自定义服务端时填写",
+        )
+        self.add_row(
+            advanced,
+            1,
+            "Cloud Studio 自动执行",
+            "check",
+            self.auto_cdp_var,
+            hint="检测到本机 Chrome CDP 时自动输入命令",
+        )
+        self.add_row(advanced, 2, "本地仓库目录", "browse", self.repo_var, self.browse_repo)
+        self.add_row(advanced, 3, "本机 fpro-client.exe", "browse", self.binary_var, self.browse_binary)
+        self.add_row(advanced, 4, "服务端地址覆盖", "entry", self.server_var, hint="留空则从加密配置读取")
+        self.add_row(advanced, 5, "控制端口覆盖", "entry", self.server_port_var, hint="留空则从加密配置读取")
+        self.add_row(advanced, 6, "TLS Server Name 覆盖", "entry", self.tls_name_var, hint="留空则从加密配置读取")
+        self.add_row(advanced, 7, "SSH 私钥目录", "entry", self.ssh_dir_var)
+        self.add_row(advanced, 8, "SSH 密钥名", "entry", self.key_name_var)
+        self.add_row(advanced, 9, "Chrome CDP 地址", "entry", self.cdp_var)
+        self.add_row(advanced, 10, "Raw 基础地址", "entry", self.raw_var)
 
         buttons = ttk.Frame(outer)
         buttons.pack(fill="x", pady=(12, 8))
@@ -618,6 +640,9 @@ class DeliveryApp(tk.Tk):
         password = self.password_entry.get()
         if not password:
             raise AppError("请输入配置包密码。")
+        key_name = self.key_name_var.get().strip() or KEY_NAME_DEFAULT
+        if not KEY_NAME_RE.fullmatch(key_name):
+            raise AppError("SSH 密钥名只能包含字母、数字、点、下划线和连字符。")
         return raw, port, password
 
     def start(self) -> None:
@@ -726,6 +751,7 @@ class DeliveryApp(tk.Tk):
                 server_port=server_port,
                 tls_server_name=tls_name,
                 fpro_user=values.get("user", ""),
+                key_name=options.key_name,
                 ssh_port=ssh_port,
                 remote_port=temp_port,
                 raw_base=options.raw_base,
@@ -851,7 +877,7 @@ class DeliveryApp(tk.Tk):
         self.proxy_ready = True
         assets = self.prepared
         self.current_url = f"http://{url_host(assets.server_addr)}:{assets.remote_port}/v1/ssh-key"
-        command = make_remote_command(assets.raw_base, self.current_url)
+        command = make_remote_command(assets.raw_base, self.current_url, assets.key_name)
         self.clipboard_clear()
         self.clipboard_append(command)
         self.update()
@@ -872,7 +898,12 @@ class DeliveryApp(tk.Tk):
         if not self.current_url:
             return
         raw_base = self.prepared.raw_base if self.prepared is not None else self.raw_var.get()
-        command = make_remote_command(raw_base, self.current_url)
+        key_name = (
+            self.prepared.key_name
+            if self.prepared is not None
+            else (self.key_name_var.get().strip() or KEY_NAME_DEFAULT)
+        )
+        command = make_remote_command(raw_base, self.current_url, key_name)
         self.clipboard_clear()
         self.clipboard_append(command)
         self.update()
@@ -895,37 +926,45 @@ class DeliveryApp(tk.Tk):
         try:
             connection = None
             selected_endpoint = ""
-            for endpoint in cdp_endpoint_candidates(cdp_endpoint):
-                try:
-                    targets_req = urllib.request.Request(endpoint + "/json/list")
-                    with urllib.request.urlopen(targets_req, timeout=2) as response:
-                        targets = json.loads(response.read().decode("utf-8"))
-                except Exception:
-                    continue
-                for target in targets:
-                    if target.get("type") != "page" or not target.get("webSocketDebuggerUrl"):
-                        continue
-                    candidate = None
+            deadline = time.monotonic() + CDP_AUTO_WAIT_SECONDS
+            wait_logged = False
+            while connection is None and time.monotonic() < deadline:
+                for endpoint in cdp_endpoint_candidates(cdp_endpoint):
                     try:
-                        candidate = websocket.create_connection(target["webSocketDebuggerUrl"], timeout=5)
-                        probe = self.cdp_call(candidate, 1, "Runtime.evaluate", {
-                            "expression": "Boolean(document.querySelector(\".xterm-helper-textarea,.xterm,.xterm-screen,[aria-label*='terminal' i]\"))",
-                            "returnByValue": True,
-                        })
-                        value = probe.get("result", {}).get("result", {}).get("value")
-                        if value:
-                            connection = candidate
-                            selected_endpoint = endpoint
-                            break
-                        candidate.close()
+                        targets_req = urllib.request.Request(endpoint + "/json/list")
+                        with urllib.request.urlopen(targets_req, timeout=2) as response:
+                            targets = json.loads(response.read().decode("utf-8"))
                     except Exception:
-                        if candidate is not None:
-                            try:
-                                candidate.close()
-                            except Exception:
-                                pass
-                if connection is not None:
-                    break
+                        continue
+                    for target in targets:
+                        if target.get("type") != "page" or not target.get("webSocketDebuggerUrl"):
+                            continue
+                        candidate = None
+                        try:
+                            candidate = websocket.create_connection(target["webSocketDebuggerUrl"], timeout=5)
+                            probe = self.cdp_call(candidate, 1, "Runtime.evaluate", {
+                                "expression": "Boolean(document.querySelector(\".xterm-helper-textarea,.xterm,.xterm-screen,[aria-label*='terminal' i]\"))",
+                                "returnByValue": True,
+                            })
+                            value = probe.get("result", {}).get("result", {}).get("value")
+                            if value:
+                                connection = candidate
+                                selected_endpoint = endpoint
+                                break
+                            candidate.close()
+                        except Exception:
+                            if candidate is not None:
+                                try:
+                                    candidate.close()
+                                except Exception:
+                                    pass
+                    if connection is not None:
+                        break
+                if connection is None:
+                    if not wait_logged:
+                        self.post("log", f"正在等待 Cloud Studio 终端（最多 {CDP_AUTO_WAIT_SECONDS} 秒）…")
+                        wait_logged = True
+                    time.sleep(1.0)
             if connection is None:
                 raise AppError("没有找到带终端的 Cloud Studio 浏览器页面。")
             try:
@@ -1087,6 +1126,18 @@ def self_test() -> int:
     assert "FPRO_SSH_RECEIVER_TOKEN_FILE" in command
     assert "FPRO_PACKAGE_PASSWORD_FILE" in command
     assert "example.invalid" in command
+    named_command = make_remote_command(
+        DEFAULT_RAW_BASE,
+        "http://example.invalid:12345/v1/ssh-key",
+        "custom_key-01",
+    )
+    assert "FPRO_SSH_KEY_NAME='custom_key-01'" in named_command
+    try:
+        make_remote_command(DEFAULT_RAW_BASE, "http://example.invalid:12345/v1/ssh-key", "bad/name")
+    except AppError:
+        pass
+    else:
+        raise AssertionError("invalid SSH key name was accepted")
     print("fpro_delivery_gui self-test PASS")
     return 0
 
