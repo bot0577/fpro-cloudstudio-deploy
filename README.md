@@ -37,7 +37,7 @@ sudo bash install.sh
 curl -fsSL https://raw.githubusercontent.com/bot0577/fpro-cloudstudio-deploy/main/install.sh | sudo bash
 ```
 
-当前仓库为私有仓库时，Raw 请求需要读取权限。推荐先使用 Git 凭据做稀疏克隆，或在运行环境中以环境变量提供只读的 `FPRO_GITHUB_TOKEN`；不要把令牌写进 URL、脚本或 Git 历史。
+仓库公开后，Raw 请求无需 GitHub 登录即可读取脚本和加密载荷。若部署在私有镜像中，Raw 请求需要读取权限；此时推荐先使用 Git 凭据做稀疏克隆，或在运行环境中以环境变量提供只读的 `FPRO_GITHUB_TOKEN`。不要把令牌写进 URL、脚本或 Git 历史。
 
 如使用镜像或固定版本，可用 `FPRO_REPO_RAW_BASE_URL` 指定不含文件名的 HTTPS Raw 目录。
 
@@ -116,7 +116,7 @@ manifest.json                 元数据
 - 每个二进制文件单独使用 AES-256-CBC + PBKDF2 加密，文件名保留平台信息。
 - Git 只提交脚本、文档和 `.enc` 文件；明文 `payload/`、私钥、auth token 与 bridge 配置不得明文提交。
 - 本地 bridge 配置只供本机连接使用，不属于部署载荷，也不上传到仓库。
-- 仓库应保持 **Private**。解密密码不写入命令行、脚本或 Git 历史。
+- 仓库可以公开：真实服务地址、证书身份、客户端私钥、auth token 和 bridge 配置只允许存在于加密载荷或运行时安全存储中。解密密码不写入命令行、脚本或 Git 历史。
 - 解密后的临时文件由安装脚本在退出时清理；运行中的配置文件仍应按主机权限保护。
 
 ## 重新加密单个平台文件
