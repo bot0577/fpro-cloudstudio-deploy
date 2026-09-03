@@ -260,9 +260,21 @@ done
 sleep 1
 # 兜底：用进程名精确匹配再清一次
 pkill -x fpro-client 2>/dev/null || true
-# 同时停掉旧的看门狗，避免重复拉起
-pkill -f "fpro-client/watchdog.sh" 2>/dev/null || true
-sleep 1
+# 同时停掉旧的看门狗，避免重复拉起。看门狗使用 flock，发送 TERM 后
+# 可能仍在 sleep；等待它真正退出，避免新实例因锁竞争瞬间退出。
+WATCHDOG_PATTERN='/opt/fpro-client/watchdog.sh'
+old_watchdogs="$(pgrep -f -- "$WATCHDOG_PATTERN" || true)"
+if [ -n "$old_watchdogs" ]; then
+    while IFS= read -r pid; do
+        [ -n "$pid" ] && [ "$pid" != "$$" ] && kill "$pid" 2>/dev/null || true
+    done <<< "$old_watchdogs"
+    for ((i = 0; i < 40; i++)); do
+        pgrep -f -- "$WATCHDOG_PATTERN" >/dev/null 2>&1 || break
+        sleep 0.25
+    done
+    # 极端情况下旧实例卡住时才强制结束；正常路径不会走到这里。
+    pkill -KILL -f -- "$WATCHDOG_PATTERN" 2>/dev/null || true
+fi
 
 # ---- 4. 安装 fpro-client 二进制 / 证书 / 配置 ------------------------------
 echo "[*] 安装 fpro-client 二进制与证书 ..."
@@ -317,8 +329,14 @@ nohup /opt/fpro-client/watchdog.sh >>/var/log/fpro-watchdog.log 2>&1 &
 watchdog_pid=$!
 sleep 4
 if ! kill -0 "$watchdog_pid" 2>/dev/null; then
-    echo "[-] 看门狗启动失败，请查看 /var/log/fpro-watchdog.log" >&2
-    exit 1
+    # 兼容极短暂的 bash→后台进程切换：只要已有看门狗实例接管锁，
+    # 就视为启动成功；否则才报告失败。
+    if pgrep -f -- "$WATCHDOG_PATTERN" >/dev/null 2>&1; then
+        echo "[+] 看门狗已由现有实例接管"
+    else
+        echo "[-] 看门狗启动失败，请查看 /var/log/fpro-watchdog.log" >&2
+        exit 1
+    fi
 fi
 
 # ---- 7. 自检 --------------------------------------------------------------

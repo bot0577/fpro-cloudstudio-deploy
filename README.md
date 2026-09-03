@@ -51,6 +51,8 @@ curl -fsSL https://raw.githubusercontent.com/bot0577/fpro-cloudstudio-deploy/mai
 在必须验证登录的自动化环境中设置 `FPRO_TUNNEL_REQUIRE_SSH=1`；此时未提供
 可用私钥会使安装失败。
 
+脚本可重复执行：重跑时会等待旧看门狗释放锁，再启动新实例。
+
 也可以从 HTTPS 地址取配置包。若二进制文件位于同一远程目录，脚本会自动推导地址：
 
 ```bash
