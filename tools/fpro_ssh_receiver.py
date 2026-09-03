@@ -16,13 +16,17 @@ The receiver never sends the package password.  The password is entered on
 this workstation, after the encrypted bytes have been received.  The HTTP
 endpoint is one-shot, checks a random application token and SHA-256, validates
 the private/public key pair, and writes the result atomically under ~/.ssh.
-Only Python's standard library plus the local ``openssl`` and ``ssh-keygen``
-commands are required.
+The temporary fpro proxy uses a separate ``--fpro-token-file`` credential for
+the fpro server; it must never be confused with the one-shot HTTP token.
+The packaged Windows app includes its crypto/key parser.  The standalone CLI
+prefers the optional ``cryptography`` package and falls back to local
+``openssl``/``ssh-keygen`` for legacy environments.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import hmac
 import http.server
@@ -45,6 +49,11 @@ import urllib.request
 from getpass import getpass
 from typing import NoReturn, Optional
 
+try:
+    from fpro_crypto import CryptoError, decrypt_file
+except ImportError:  # pragma: no cover - package-relative import when embedded
+    from .fpro_crypto import CryptoError, decrypt_file
+
 
 MAX_BUNDLE_BYTES = 4 * 1024 * 1024
 MAX_KEY_BYTES = 128 * 1024
@@ -66,6 +75,14 @@ def validate_token(token: str) -> str:
     token = token.strip()
     if not TOKEN_RE.fullmatch(token):
         fail("传输 token 格式无效；请使用至少 16 位随机字母数字 token。")
+    return token
+
+
+def validate_fpro_token(token: str) -> str:
+    """Validate the fpro server credential without applying receiver-token rules."""
+    token = token.strip()
+    if not token or len(token) > 4096 or "\r" in token or "\n" in token:
+        fail("fpro 认证 token 为空、过长或包含换行。")
     return token
 
 
@@ -105,31 +122,71 @@ def ensure_command(name: str) -> None:
 
 
 def ssh_fingerprint(public_text: str) -> str:
-    ensure_command("ssh-keygen")
-    result = run_capture(["ssh-keygen", "-lf", "-"], input_bytes=public_text.encode())
-    if result.returncode != 0:
-        detail = result.stderr.decode("utf-8", "replace").strip()
-        fail(f"SSH 公钥无效：{detail[:300]}")
-    fields = result.stdout.decode("utf-8", "replace").split()
-    if len(fields) < 2:
-        fail("ssh-keygen 没有返回公钥指纹。")
-    return fields[1]
+    """Return an OpenSSH-compatible SHA256 fingerprint.
+
+    Prefer the bundled ``cryptography`` implementation so the Windows
+    one-click executable does not require an independently installed
+    ``ssh-keygen``.  Keep the command-line fallback for unusual legacy key
+    formats and for the standalone CLI on minimal Python installations.
+    """
+    try:
+        from cryptography.hazmat.primitives import serialization
+
+        key = serialization.load_ssh_public_key(public_text.encode("utf-8"))
+        blob = key.public_bytes(
+            serialization.Encoding.OpenSSH,
+            serialization.PublicFormat.OpenSSH,
+        )
+        # OpenSSH's wire blob is the portion after the key type and before an
+        # optional comment.  Re-parse the canonical serialized line so labels
+        # in the incoming .pub file cannot affect the digest.
+        parts = blob.split()
+        if len(parts) < 2:
+            raise ValueError("empty public key blob")
+        digest = hashlib.sha256(base64.b64decode(parts[1])).digest()
+        return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+    except Exception as python_error:
+        if shutil.which("ssh-keygen") is None:
+            fail(f"SSH 公钥无效或当前环境缺少密钥解析支持：{python_error}")
+        result = run_capture(["ssh-keygen", "-lf", "-"], input_bytes=public_text.encode())
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", "replace").strip()
+            fail(f"SSH 公钥无效：{detail[:300]}")
+        fields = result.stdout.decode("utf-8", "replace").split()
+        if len(fields) < 2:
+            fail("ssh-keygen 没有返回公钥指纹。")
+        return fields[1]
 
 
 def derive_public(private_path: pathlib.Path, passphrase: str = "") -> str:
-    ensure_command("ssh-keygen")
-    # -P prevents ssh-keygen from opening an interactive prompt while the
-    # receiver is running in an HTTP worker thread.
-    result = run_capture(
-        ["ssh-keygen", "-y", "-P", passphrase, "-f", str(private_path)]
-    )
-    if result.returncode != 0:
-        detail = result.stderr.decode("utf-8", "replace").strip()
-        fail(f"无法从 SSH 私钥导出公钥：{detail[:300]}")
-    public = result.stdout.decode("utf-8", "replace").strip()
-    if not key_line(public):
-        fail("从 SSH 私钥导出的公钥为空。")
-    return public + "\n"
+    try:
+        from cryptography.hazmat.primitives import serialization
+
+        private_data = private_path.read_bytes()
+        password = passphrase.encode("utf-8") if passphrase else None
+        key = serialization.load_ssh_private_key(private_data, password=password)
+        public = key.public_key().public_bytes(
+            serialization.Encoding.OpenSSH,
+            serialization.PublicFormat.OpenSSH,
+        ).decode("utf-8", "replace").strip()
+        if not key_line(public):
+            raise ValueError("empty derived public key")
+        return public + "\n"
+    except Exception as python_error:
+        if shutil.which("ssh-keygen") is None:
+            fail(f"无法从 SSH 私钥导出公钥：{python_error}")
+        # -P prevents ssh-keygen from opening an interactive prompt while the
+        # receiver is running in an HTTP worker thread.
+        result = run_capture(
+            ["ssh-keygen", "-y", "-P", passphrase, "-f", str(private_path)]
+        )
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", "replace").strip()
+            fail(f"无法从 SSH 私钥导出公钥：{detail[:300]}")
+        public = result.stdout.decode("utf-8", "replace").strip()
+        if not key_line(public):
+            fail("从 SSH 私钥导出的公钥为空。")
+        return public + "\n"
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -216,7 +273,12 @@ def read_secret(args: argparse.Namespace, *, kind: str) -> str:
     elif direct_arg:
         value = direct_arg
     else:
-        prompt = "解压密码: " if kind == "password" else "传输 token: "
+        if kind == "password":
+            prompt = "解压密码: "
+        elif kind == "fpro_token":
+            prompt = "fpro 认证 token: "
+        else:
+            prompt = "传输 token: "
         value = getpass(prompt)
     if not value:
         fail(f"{kind} 不能为空。")
@@ -337,26 +399,11 @@ def decrypt_and_validate(
     ssh_passphrase: Optional[str],
     prompt_for_key_passphrase: bool = True,
 ) -> tuple[str, bytes, bytes, str]:
-    ensure_command("openssl")
     with tempfile.TemporaryDirectory(prefix="fpro-key-decrypt-") as work:
         tar_path = pathlib.Path(work) / "bundle.tar.gz"
-        result = run_capture(
-            [
-                "openssl",
-                "enc",
-                "-d",
-                "-aes-256-cbc",
-                "-pbkdf2",
-                "-in",
-                str(encrypted_path),
-                "-out",
-                str(tar_path),
-                "-pass",
-                "stdin",
-            ],
-            input_bytes=(password + "\n").encode(),
-        )
-        if result.returncode != 0 or not tar_path.is_file():
+        try:
+            tar_path.write_bytes(decrypt_file(encrypted_path, password, max_bytes=MAX_BUNDLE_BYTES))
+        except (CryptoError, OSError):
             fail("解密失败：密码错误或密钥包损坏。")
         return parse_archive(
             tar_path,
@@ -820,7 +867,6 @@ def terminate_process(process: subprocess.Popen) -> None:
 
 
 def start_fpro_proxy(args: argparse.Namespace) -> int:
-    ensure_command("ssh-keygen")
     binary = pathlib.Path(args.fpro_binary).expanduser().resolve()
     if not binary.is_file():
         fail(f"找不到 fpro-client 二进制：{binary}")
@@ -834,17 +880,21 @@ def start_fpro_proxy(args: argparse.Namespace) -> int:
         fail("--proxy-timeout 必须是正数秒。")
     if not math.isfinite(args.response_grace) or args.response_grace < 0:
         fail("--response-grace 必须是非负数秒。")
-    token = validate_token(read_secret(args, kind="token"))
+    receiver_token = validate_token(read_secret(args, kind="token"))
+    fpro_token = validate_fpro_token(read_secret(args, kind="fpro_token"))
     for path_arg in (args.tls_cert, args.tls_key, args.tls_ca):
         if not pathlib.Path(path_arg).expanduser().is_file():
             fail(f"TLS 文件不存在：{path_arg}")
 
-    server, state = make_receiver(args, token)
+    server, state = make_receiver(args, receiver_token)
     local_host, local_port = server.server_address[:2]
     temp_dir = pathlib.Path(tempfile.mkdtemp(prefix="fpro-key-proxy-"))
-    token_file = temp_dir / "auth-token"
-    token_file.write_text(token + "\n", encoding="utf-8")
-    chmod_private(token_file)
+    receiver_token_file = temp_dir / "receiver-token"
+    receiver_token_file.write_text(receiver_token + "\n", encoding="utf-8")
+    chmod_private(receiver_token_file)
+    fpro_token_file = temp_dir / "fpro-auth-token"
+    fpro_token_file.write_text(fpro_token + "\n", encoding="utf-8")
+    chmod_private(fpro_token_file)
     log_file = temp_dir / "fpro-client.log"
     client_id = args.client_id or f"fpro-key-delivery-{secrets.token_hex(6)}"
     proxy_name = args.proxy_name or f"fpro-key-delivery-{secrets.token_hex(4)}"
@@ -862,7 +912,7 @@ def start_fpro_proxy(args: argparse.Namespace) -> int:
                 "log.level = \"warn\"",
                 "auth.method = \"aes\"",
                 "auth.tokenSource.type = \"file\"",
-                f"auth.tokenSource.file.path = {toml_quote(str(token_file))}",
+                f"auth.tokenSource.file.path = {toml_quote(str(fpro_token_file))}",
                 "auth.additionalScopes = [\"HeartBeats\", \"NewWorkConns\"]",
                 "transport.protocol = \"tcp\"",
                 "transport.tls.enable = true",
@@ -895,14 +945,16 @@ def start_fpro_proxy(args: argparse.Namespace) -> int:
             stdout=log_handle,
             stderr=subprocess.STDOUT,
         )
-        if not wait_for_health(args.server_addr, args.remote_port, token, args.proxy_timeout):
+        if not wait_for_health(
+            args.server_addr, args.remote_port, receiver_token, args.proxy_timeout
+        ):
             detail = log_file.read_text(encoding="utf-8", errors="replace")[-2000:]
             fail(f"临时 fpro 端口未上线。客户端日志：{detail}")
         remote_url_host = url_host(args.server_addr)
         print(f"临时 fpro 通道已建立: {remote_url_host}:{args.remote_port}")
         print(f"请将以下变量传给容器内 install.sh（token 不要写入 Git）：")
         print(f"FPRO_SSH_RECEIVER_URL=http://{remote_url_host}:{args.remote_port}{args.endpoint}")
-        print(f"FPRO_SSH_RECEIVER_TOKEN={token}")
+        print(f"FPRO_SSH_RECEIVER_TOKEN={receiver_token}")
         print("等待一次性密钥包传输……")
         sys.stdout.flush()
         while not state.done.wait(0.25):
@@ -936,13 +988,36 @@ def start_fpro_proxy(args: argparse.Namespace) -> int:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def add_secret_options(parser: argparse.ArgumentParser, *, token: bool = False) -> None:
-    kind = "token" if token else "password"
-    parser.add_argument(f"--{kind}-file", help=f"从文件读取 {kind}（文件不会上传）")
-    parser.add_argument(f"--{kind}-stdin", action="store_true", help=f"从 stdin 读取 {kind}")
-    parser.add_argument(f"--{kind}-env", help=f"从指定环境变量读取 {kind}")
-    if token:
-        parser.add_argument("--token", help="方便测试；生产环境建议使用 --token-file/--token-env")
+def add_secret_options(
+    parser: argparse.ArgumentParser,
+    *,
+    token: bool = False,
+    kind: Optional[str] = None,
+) -> None:
+    secret_kind = kind or ("token" if token else "password")
+    option_kind = secret_kind.replace("_", "-")
+    parser.add_argument(
+        f"--{option_kind}-file",
+        dest=f"{secret_kind}_file",
+        help=f"从文件读取 {secret_kind}（文件不会上传）",
+    )
+    parser.add_argument(
+        f"--{option_kind}-stdin",
+        dest=f"{secret_kind}_stdin",
+        action="store_true",
+        help=f"从 stdin 读取 {secret_kind}",
+    )
+    parser.add_argument(
+        f"--{option_kind}-env",
+        dest=f"{secret_kind}_env",
+        help=f"从指定环境变量读取 {secret_kind}",
+    )
+    if token or secret_kind == "fpro_token":
+        parser.add_argument(
+            f"--{option_kind}",
+            dest=secret_kind,
+            help=f"方便测试；生产环境建议使用 --{option_kind}-file/--{option_kind}-env",
+        )
 
 
 def add_key_options(parser: argparse.ArgumentParser) -> None:
@@ -1010,6 +1085,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     proxy.add_argument("--timeout", type=float, default=300)
     add_secret_options(proxy, token=True)
+    add_secret_options(proxy, kind="fpro_token")
     add_secret_options(proxy, token=False)
     add_key_options(proxy)
 

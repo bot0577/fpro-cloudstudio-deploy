@@ -19,6 +19,8 @@
 #    # 使用本机 fpro_ssh_receiver.py 建立的一次性接收端点自动交付：
 #    sudo env FPRO_SSH_GENERATE=1 FPRO_SSH_RECEIVER_URL=... \
 #      FPRO_SSH_RECEIVER_TOKEN_FILE=/path/to/token bash install.sh
+#    # 自动化调用方也可把密码放入临时 600 文件，完成后立即删除：
+#    sudo env FPRO_PACKAGE_PASSWORD_FILE=/path/to/password bash install.sh
 #    或通过 PKG_URL / BINARY_BASE_URL 覆盖默认下载地址
 # ============================================================================
 
@@ -40,6 +42,7 @@ SSH_RECEIVER_URL="${FPRO_SSH_RECEIVER_URL:-}"
 SSH_RECEIVER_TOKEN="${FPRO_SSH_RECEIVER_TOKEN:-}"
 SSH_RECEIVER_TOKEN_FILE="${FPRO_SSH_RECEIVER_TOKEN_FILE:-}"
 SSH_RECEIVER_TIMEOUT="${FPRO_SSH_RECEIVER_TIMEOUT:-60}"
+PACKAGE_PASSWORD_FILE="${FPRO_PACKAGE_PASSWORD_FILE:-}"
 SCRIPT_REF="${BASH_SOURCE[0]:-}"
 if [ -n "$SCRIPT_REF" ] && [ -f "$SCRIPT_REF" ]; then
     DIR="$(cd "$(dirname "$SCRIPT_REF")" && pwd)"
@@ -199,7 +202,13 @@ download_artifact "$PKG_INPUT" "$PKG"
 echo "=========================================================="
 echo "  fpro 一键部署 — 请输入压缩包解压密码"
 echo "=========================================================="
-if [ -t 0 ]; then
+if [ -n "$PACKAGE_PASSWORD_FILE" ]; then
+    [ -f "$PACKAGE_PASSWORD_FILE" ] || die "FPRO_PACKAGE_PASSWORD_FILE 不存在：$PACKAGE_PASSWORD_FILE"
+    # Read one line so a Windows-style final newline cannot accidentally
+    # become part of the password used for the SSH export bundle.
+    IFS= read -r PASS < "$PACKAGE_PASSWORD_FILE" || true
+    PASS="${PASS%$'\r'}"
+elif [ -t 0 ]; then
     read -r -s -p "解压密码: " PASS
 elif [ -r /dev/tty ]; then
     # 支持 curl | sudo bash：脚本内容占用 stdin，密码改从控制终端读取。

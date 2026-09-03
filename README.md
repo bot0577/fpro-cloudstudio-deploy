@@ -8,6 +8,18 @@ Cloud Studio 容器重启后，容器内的 `fpro-client`、`sshd` 和隧道进�
 
 > 操作者按步骤执行的速查版见 [使用说明.md](使用说明.md)。
 
+## Windows 操作者：优先使用一键 EXE
+
+构建后生成 `dist/FProCloudStudio.exe`。Windows 操作者通常只需双击该文件，
+输入一次配置包密码并点击“开始一键部署”；程序会按本机架构下载加密客户端，
+解密配置、启动临时 fpro 通道，自动向已打开的 Cloud Studio 终端执行安装，
+再接收并解密 SSH 私钥到 `%USERPROFILE%\.ssh`。没有 Chrome CDP 时，程序会
+把后备指令复制到剪贴板。
+
+EXE 内置解密和密钥校验逻辑，不要求另外安装 Python 或 OpenSSL；网络访问和
+Cloud Studio 登录仍须由操作者提供。构建命令及高级/手动流程见
+[使用说明.md](使用说明.md)。
+
 ## 文件布局
 
 仓库根目录中的二进制文件保持平台原名，仅在末尾增加 `.enc`：
@@ -213,7 +225,8 @@ ssh -i ~/.ssh/fpro-cloudstudio -p <remote-port> root@<tunnel-host>
 Git）：
 
 ```text
-<receiver-token-file>       一次性随机 token
+<receiver-token-file>       一次性随机 token（仅用于本次 HTTP 接收）
+<fpro-auth-token-file>      fpro 服务端认证 token（从加密载荷取出）
 <package-password-file>     fpro-deploy.tar.gz.enc 的密码
 <client.crt> <client.key> <ca.crt>    临时 fpro 客户端的 TLS 材料
 ```
@@ -232,12 +245,15 @@ python tools/fpro_ssh_receiver.py proxy \
   --tls-ca <path-to-ca.crt> \
   --tls-server-name <tls-server-name> \
   --token-file <receiver-token-file> \
+  --fpro-token-file <fpro-auth-token-file> \
   --password-file <package-password-file> \
   --ssh-dir ~/.ssh \
   --key-name fpro-cloudstudio
 ```
 
-工具会先用带 token 的 `/healthz` 请求确认完整 HTTP 路径可用，不使用会占用
+`--token-file` 是本次接收器的一次性随机 token；`--fpro-token-file` 是 fpro
+客户端连接服务端所需的长期认证 token，二者必须不同。fpro token 只从本机受保护
+的解密载荷读取，不传给 Cloud Studio。工具会先用带 token 的 `/healthz` 请求确认完整 HTTP 路径可用，不使用会占用
 首个 work connection 的裸 TCP 探测。启动后它会打印本次临时通道的 URL 和 token；
 只在目标容器的当前进程环境中使用它们：
 

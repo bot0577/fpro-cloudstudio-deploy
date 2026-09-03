@@ -4,6 +4,9 @@ payload/
 fpro-cloudstudio-*.tar.gz.enc
 __pycache__/
 *.py[cod]
+build/
+dist/
+*.spec
 
 # Platform binaries must only be added after encryption.  Keep accidental
 # plaintext copies out of the index while allowing the encrypted artifacts.
