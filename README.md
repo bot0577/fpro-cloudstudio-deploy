@@ -45,6 +45,12 @@ curl -fsSL https://raw.githubusercontent.com/bot0577/fpro-cloudstudio-deploy/mai
 `x86_64` 使用 `fpro-client_linux_amd64.b64.enc`，`aarch64` 使用
 `fpro-client_linux_arm64.b64.enc`。本地包和二进制存在时使用脚本同目录文件，否则自动使用默认 GitHub Raw 目录。
 
+安装末尾会进行隧道回环自检。如果运行环境中有对应的 SSH 私钥，可通过
+`FPRO_TUNNEL_SSH_KEY=/path/to/key` 让脚本完成登录验证；没有私钥时，脚本仍会
+验证远端端口和 SSH 握手已响应，并提示跳过登录验证，不会因此误报安装失败。
+在必须验证登录的自动化环境中设置 `FPRO_TUNNEL_REQUIRE_SSH=1`；此时未提供
+可用私钥会使安装失败。
+
 也可以从 HTTPS 地址取配置包。若二进制文件位于同一远程目录，脚本会自动推导地址：
 
 ```bash

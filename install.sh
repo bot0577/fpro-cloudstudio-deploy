@@ -337,12 +337,33 @@ TUNNEL_PORT="${FPRO_TUNNEL_PORT:-$(read_toml_scalar remotePort "$PAY/fpro-client
 [[ "$TUNNEL_PORT" =~ ^[0-9]+$ ]] || die "无法从加密配置读取有效的 remotePort。"
 [[ "$TUNNEL_HOST" =~ ^[A-Za-z0-9._:-]+$ ]] || die "加密配置中的 serverAddr 格式无效。"
 
-if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=6 -o BatchMode=yes \
-       -p "$TUNNEL_PORT" "root@$TUNNEL_HOST" 'echo TUNNEL_OK' 2>/dev/null | grep -q TUNNEL_OK; then
-    echo "[+] 隧道已打通：ssh -p $TUNNEL_PORT root@$TUNNEL_HOST 可用"
+# 如果调用方提供了对应的 SSH 私钥，则执行完整的登录验证。密钥不属于
+# 部署载荷，也不会被写入仓库；通过 FPRO_TUNNEL_SSH_KEY 临时传入即可。
+declare -a SSH_SELFTEST_ARGS=()
+if [ -n "${FPRO_TUNNEL_SSH_KEY:-}" ]; then
+    [ -f "$FPRO_TUNNEL_SSH_KEY" ] || die "FPRO_TUNNEL_SSH_KEY 不存在：$FPRO_TUNNEL_SSH_KEY"
+    SSH_SELFTEST_ARGS=(-i "$FPRO_TUNNEL_SSH_KEY" -o IdentitiesOnly=yes)
+fi
+
+# 没有私钥时，ssh 仍会完成 TCP/SSH 握手并返回 publickey 认证提示。将这种
+# 情况视为“隧道端口已响应但无法在容器内完成登录”，避免 Cloud Studio 等
+# 没有用户私钥的环境被误报为安装失败；其它连接错误仍然使安装失败。
+TUNNEL_TEST_OUT="$TMP/tunnel-selftest.out"
+TUNNEL_TEST_ERR="$TMP/tunnel-selftest.err"
+ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=6 -o BatchMode=yes \
+    "${SSH_SELFTEST_ARGS[@]}" -p "$TUNNEL_PORT" "root@$TUNNEL_HOST" \
+    'echo TUNNEL_OK' >"$TUNNEL_TEST_OUT" 2>"$TUNNEL_TEST_ERR" || true
+if grep -qx 'TUNNEL_OK' "$TUNNEL_TEST_OUT"; then
+    echo "[+] 隧道已打通：SSH 登录自检通过"
+elif grep -Eiq 'Permission denied \((publickey|keyboard-interactive|publickey,password)|No more authentication methods to try' "$TUNNEL_TEST_ERR"; then
+    if [ -n "${FPRO_TUNNEL_SSH_KEY:-}" ] || [ "${FPRO_TUNNEL_REQUIRE_SSH:-0}" = "1" ]; then
+        echo "[-] 隧道已响应，但 SSH 私钥认证失败。" >&2
+        exit 1
+    fi
+    echo "[!] 隧道端口已响应，但容器内没有可用 SSH 私钥；已跳过登录验证。"
 else
-    echo "[-] 隧道回环自检未通过（进程可能还在握手），请稍后重试：" >&2
-    echo "      ssh -p $TUNNEL_PORT root@$TUNNEL_HOST"
+    echo "[-] 隧道回环自检未通过（连接或 SSH 握手失败），请稍后重试：" >&2
+    echo "      ssh -p $TUNNEL_PORT root@$TUNNEL_HOST" >&2
     exit 1
 fi
 
