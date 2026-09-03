@@ -14,6 +14,11 @@
 #  使用（容器重启后）：
 #    bash install.sh             # 本地文件存在时使用本地文件，否则从 GitHub Raw 下载
 #    curl -fsSL https://raw.githubusercontent.com/bot0577/fpro-cloudstudio-deploy/main/install.sh | sudo bash
+#    # 没有本地 SSH 密钥时，生成一对并导出加密私钥包：
+#    sudo env FPRO_SSH_GENERATE=1 bash install.sh
+#    # 使用本机 fpro_ssh_receiver.py 建立的一次性接收端点自动交付：
+#    sudo env FPRO_SSH_GENERATE=1 FPRO_SSH_RECEIVER_URL=... \
+#      FPRO_SSH_RECEIVER_TOKEN_FILE=/path/to/token bash install.sh
 #    或通过 PKG_URL / BINARY_BASE_URL 覆盖默认下载地址
 # ============================================================================
 
@@ -30,6 +35,11 @@ trap on_error ERR
 PKG_NAME="fpro-deploy.tar.gz.enc"
 RAW_BASE_URL="${FPRO_REPO_RAW_BASE_URL:-https://raw.githubusercontent.com/bot0577/fpro-cloudstudio-deploy/main}"
 RAW_BASE_URL="${RAW_BASE_URL%/}"
+SSH_KEY_NAME="${FPRO_SSH_KEY_NAME:-fpro-cloudstudio}"
+SSH_RECEIVER_URL="${FPRO_SSH_RECEIVER_URL:-}"
+SSH_RECEIVER_TOKEN="${FPRO_SSH_RECEIVER_TOKEN:-}"
+SSH_RECEIVER_TOKEN_FILE="${FPRO_SSH_RECEIVER_TOKEN_FILE:-}"
+SSH_RECEIVER_TIMEOUT="${FPRO_SSH_RECEIVER_TIMEOUT:-60}"
 SCRIPT_REF="${BASH_SOURCE[0]:-}"
 if [ -n "$SCRIPT_REF" ] && [ -f "$SCRIPT_REF" ]; then
     DIR="$(cd "$(dirname "$SCRIPT_REF")" && pwd)"
@@ -50,7 +60,28 @@ die() {
     exit 1
 }
 
+[[ "$SSH_KEY_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || die "FPRO_SSH_KEY_NAME 只能包含字母、数字、点、下划线和连字符。"
 [[ "$RAW_BASE_URL" == https://* ]] || die "FPRO_REPO_RAW_BASE_URL 必须使用 HTTPS。"
+if [ -n "$SSH_RECEIVER_URL" ]; then
+    [[ "$SSH_RECEIVER_URL" =~ ^https?://[^[:space:]]+$ ]] \
+        || die "FPRO_SSH_RECEIVER_URL 必须是 http(s) URL。"
+    if [ -n "$SSH_RECEIVER_TOKEN_FILE" ]; then
+        [ -z "$SSH_RECEIVER_TOKEN" ] \
+            || die "请只设置 FPRO_SSH_RECEIVER_TOKEN 或 FPRO_SSH_RECEIVER_TOKEN_FILE 其中一个。"
+        [ -f "$SSH_RECEIVER_TOKEN_FILE" ] \
+            || die "FPRO_SSH_RECEIVER_TOKEN_FILE 不存在：$SSH_RECEIVER_TOKEN_FILE"
+        # Read exactly the first line; the token itself never enters the
+        # command line or shell history.  A missing final newline is valid.
+        IFS= read -r SSH_RECEIVER_TOKEN < "$SSH_RECEIVER_TOKEN_FILE" || true
+        SSH_RECEIVER_TOKEN="${SSH_RECEIVER_TOKEN%$'\r'}"
+    fi
+    [[ "$SSH_RECEIVER_TOKEN" =~ ^[A-Za-z0-9._~-]{16,256}$ ]] \
+        || die "FPRO_SSH_RECEIVER_TOKEN 必须是 16-256 位随机 token。"
+    [[ "$SSH_RECEIVER_TIMEOUT" =~ ^[1-9][0-9]*$ ]] \
+        || die "FPRO_SSH_RECEIVER_TIMEOUT 必须是正整数秒数。"
+elif [ -n "$SSH_RECEIVER_TOKEN" ] || [ -n "$SSH_RECEIVER_TOKEN_FILE" ]; then
+    die "设置 FPRO_SSH_RECEIVER_TOKEN(_FILE) 前必须先设置 FPRO_SSH_RECEIVER_URL。"
+fi
 
 download_artifact() {
     local source="$1"
@@ -247,9 +278,50 @@ else
     fi
 fi
 [ -s "$FPRO_BIN" ] || die "架构二进制为空或不存在：$FPRO_BIN"
-unset PASS
 
-# ---- 3. 结束此前的 fpro-client 进程（精确匹配 /proc/<pid>/exe） -----------
+# PASS 还要用于可选的 SSH 私钥加密导出；完成导出后立即清除。
+SSH_PUBLIC_KEY_SOURCE=""
+SSH_DERIVED_PUBLIC_KEY=""
+SSH_PRIVATE_KEY_PATH=""
+SSH_KEY_FINGERPRINT=""
+SSH_KEY_EXPORT_PATH=""
+SSH_KEY_GENERATED=0
+SSH_GENERATED_KEY_PASSPHRASE=""
+SSH_KEY_DELIVERED=0
+
+# ---- 3. 清理旧实例（先看门狗、后客户端，避免锁被子进程继承） -----------
+# 看门狗把 flock 文件描述符继承给 fpro-client；必须先停止看门狗，再
+# 等待旧客户端完全退出，否则新看门狗可能因旧锁仍被占用而立即结束。
+WATCHDOG_PATTERN='/opt/fpro-client/watchdog.sh'
+list_watchdog_pids() {
+    local proc pid cmdline
+    for proc in /proc/[0-9]*; do
+        [ -r "$proc/cmdline" ] || continue
+        pid="${proc##*/}"
+        [ "$pid" = "$$" ] && continue
+        cmdline="$(tr '\0' '\n' < "$proc/cmdline" 2>/dev/null || true)"
+        # 使用 here-string 避免 pipefail + grep -q 的 SIGPIPE 误判。
+        if grep -Fx "$WATCHDOG_PATTERN" <<< "$cmdline" >/dev/null 2>&1; then
+            printf '%s\n' "$pid"
+        fi
+    done
+}
+
+old_watchdogs="$(list_watchdog_pids)"
+if [ -n "$old_watchdogs" ]; then
+    while IFS= read -r pid; do
+        [ -n "$pid" ] && [ "$pid" != "$$" ] && kill "$pid" 2>/dev/null || true
+    done <<< "$old_watchdogs"
+    for ((i = 0; i < 40; i++)); do
+        [ -z "$(list_watchdog_pids)" ] && break
+        sleep 0.25
+    done
+    # 极端情况下旧实例卡住时才强制结束；正常路径不会走到这里。
+    while IFS= read -r pid; do
+        [ -n "$pid" ] && [ "$pid" != "$$" ] && kill -KILL "$pid" 2>/dev/null || true
+    done < <(list_watchdog_pids)
+fi
+
 echo "[*] 清理既有 fpro-client 进程 ..."
 for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
     exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
@@ -257,23 +329,48 @@ for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
         */fpro-client) kill "$pid" 2>/dev/null && echo "    终止旧进程 pid=$pid" ;;
     esac
 done
-sleep 1
-# 兜底：用进程名精确匹配再清一次
+# 兜底：用进程名精确匹配再清一次，然后等待其释放继承的 flock。
 pkill -x fpro-client 2>/dev/null || true
-# 同时停掉旧的看门狗，避免重复拉起。看门狗使用 flock，发送 TERM 后
-# 可能仍在 sleep；等待它真正退出，避免新实例因锁竞争瞬间退出。
-WATCHDOG_PATTERN='/opt/fpro-client/watchdog.sh'
-old_watchdogs="$(pgrep -f -- "$WATCHDOG_PATTERN" || true)"
-if [ -n "$old_watchdogs" ]; then
+for ((i = 0; i < 40; i++)); do
+    pgrep -x fpro-client >/dev/null 2>&1 || break
+    sleep 0.25
+done
+# 极端情况下旧客户端卡住时才强制结束；正常路径不会走到这里。
+pkill -KILL -x fpro-client 2>/dev/null || true
+
+# 旧版看门狗可能把锁描述符遗留给 sleep/fpro-client 子进程；逐个检查
+# 描述符并清理专属锁的持有者，确保新实例不会因旧锁竞态而退出。
+WATCHDOG_LOCK='/var/lock/fpro-client-watchdog.lock'
+WATCHDOG_LOCK_REAL="$(readlink -f "$WATCHDOG_LOCK" 2>/dev/null || printf '%s' "$WATCHDOG_LOCK")"
+list_watchdog_lock_holders() {
+    local proc fd target pid
+    for proc in /proc/[0-9]*; do
+        [ -d "$proc/fd" ] || continue
+        pid="${proc##*/}"
+        [ "$pid" = "$$" ] && continue
+        for fd in "$proc"/fd/*; do
+            [ -e "$fd" ] || continue
+            target="$(readlink "$fd" 2>/dev/null || true)"
+            if [ "$target" = "$WATCHDOG_LOCK" ] || [ "$target" = "$WATCHDOG_LOCK_REAL" ]; then
+                printf '%s\n' "$pid"
+                break
+            fi
+        done
+    done
+}
+
+lock_holders="$(list_watchdog_lock_holders)"
+if [ -n "$lock_holders" ]; then
     while IFS= read -r pid; do
         [ -n "$pid" ] && [ "$pid" != "$$" ] && kill "$pid" 2>/dev/null || true
-    done <<< "$old_watchdogs"
+    done <<< "$lock_holders"
     for ((i = 0; i < 40; i++)); do
-        pgrep -f -- "$WATCHDOG_PATTERN" >/dev/null 2>&1 || break
+        [ -z "$(list_watchdog_lock_holders)" ] && break
         sleep 0.25
     done
-    # 极端情况下旧实例卡住时才强制结束；正常路径不会走到这里。
-    pkill -KILL -f -- "$WATCHDOG_PATTERN" 2>/dev/null || true
+    while IFS= read -r pid; do
+        [ -n "$pid" ] && [ "$pid" != "$$" ] && kill -KILL "$pid" 2>/dev/null || true
+    done < <(list_watchdog_lock_holders)
 fi
 
 # ---- 4. 安装 fpro-client 二进制 / 证书 / 配置 ------------------------------
@@ -291,19 +388,11 @@ echo "[+] 二进制: $(fpro-client --version 2>&1 | head -1 || echo unknown)"
 
 # ---- 5. 配置 sshd ---------------------------------------------------------
 echo "[*] 配置 sshd (root 密钥登录 / 关闭密码登录) ..."
-mkdir -p /root/.ssh && chmod 700 /root/.ssh
-if ! grep -qF "$(cat "$PAY/ssh/authorized_keys")" /root/.ssh/authorized_keys 2>/dev/null; then
-    cat "$PAY/ssh/authorized_keys" >> /root/.ssh/authorized_keys
-fi
-chmod 600 /root/.ssh/authorized_keys
-mkdir -p /etc/ssh/sshd_config.d
-cp "$PAY/sshd_config.d/90-ragp.conf" /etc/ssh/sshd_config.d/90-ragp.conf
-chmod 644 /etc/ssh/sshd_config.d/90-ragp.conf
 
-# 确保 sshd 存在；缺失则尝试安装（容器通常已带 openssh-server）
+# 确保 sshd 和 ssh-keygen 存在；容器通常已经预装 openssh-server。
 if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
     echo "    [!] 未找到 sshd，尝试 apt-get 安装 ..."
-    apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq openssh-server >/dev/null 2>&1 \
+    apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq openssh-server openssh-client >/dev/null 2>&1 \
         || echo "    [!] 自动安装失败，请手动安装 openssh-server 后重跑本脚本。"
 fi
 SSHD_BIN="$(command -v sshd || echo /usr/sbin/sshd)"
@@ -311,6 +400,277 @@ if [ ! -x "$SSHD_BIN" ]; then
     echo "[-] 找不到可执行的 sshd。" >&2
     exit 1
 fi
+if ! command -v ssh-keygen >/dev/null 2>&1; then
+    echo "[-] 找不到 ssh-keygen；无法校验或生成 root 登录密钥。" >&2
+    exit 1
+fi
+
+mkdir -p /root/.ssh && chmod 700 /root/.ssh
+
+key_fingerprint_from_file() {
+    local source="$1"
+    ssh-keygen -lf "$source" 2>/dev/null | awk 'NF >= 2 { print $2; exit }'
+}
+
+validate_authorized_keys() {
+    local source="$1" line found=0
+    [ -s "$source" ] || die "找不到有效的 SSH 公钥文件：$source"
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        case "$line" in
+            ""|\#*) continue ;;
+        esac
+        if ! printf '%s\n' "$line" | ssh-keygen -lf - >/dev/null 2>&1; then
+            die "SSH 公钥格式无效：$source"
+        fi
+        found=1
+    done < "$source"
+    [ "$found" -eq 1 ] || die "SSH 公钥文件为空：$source"
+}
+
+derive_public_key() {
+    local private="$1" output="$2"
+    if ! ssh-keygen -y -f "$private" > "$output" 2>/dev/null; then
+        die "无法从 SSH 私钥读取公钥：$private（若私钥有口令，请先使用无口令副本或跳过自动自检）"
+    fi
+    [ -s "$output" ] || die "从 SSH 私钥导出的公钥为空：$private"
+}
+
+# 密钥来源优先级：显式公钥 → 显式私钥导出的公钥 → 自动生成 →
+# 加密载荷中可选的私钥 → 加密载荷中的公钥。默认只落地公钥，私钥不会
+# 被脚本打印或写入 Git；FPRO_SSH_GENERATE=1 才会生成一次性密钥并导出。
+SSH_EXPLICIT_PUBLIC="${FPRO_AUTHORIZED_KEYS_FILE:-}"
+SSH_INLINE_PUBLIC="${FPRO_AUTHORIZED_KEY:-}"
+SSH_EXPLICIT_PRIVATE="${FPRO_SSH_PRIVATE_KEY:-}"
+PAYLOAD_PRIVATE_KEY="$PAY/ssh/$SSH_KEY_NAME"
+
+if [ -n "$SSH_EXPLICIT_PRIVATE" ]; then
+    [ -f "$SSH_EXPLICIT_PRIVATE" ] || die "FPRO_SSH_PRIVATE_KEY 不存在：$SSH_EXPLICIT_PRIVATE"
+    SSH_DERIVED_PUBLIC_KEY="$TMP/authorized_keys.from-private"
+    derive_public_key "$SSH_EXPLICIT_PRIVATE" "$SSH_DERIVED_PUBLIC_KEY"
+    SSH_PRIVATE_KEY_PATH="$SSH_EXPLICIT_PRIVATE"
+fi
+
+if [ -n "$SSH_INLINE_PUBLIC" ]; then
+    SSH_PUBLIC_KEY_SOURCE="$TMP/authorized_keys.inline"
+    printf '%s\n' "$SSH_INLINE_PUBLIC" > "$SSH_PUBLIC_KEY_SOURCE"
+elif [ -n "$SSH_EXPLICIT_PUBLIC" ]; then
+    SSH_PUBLIC_KEY_SOURCE="$SSH_EXPLICIT_PUBLIC"
+elif [ -n "$SSH_EXPLICIT_PRIVATE" ]; then
+    SSH_PUBLIC_KEY_SOURCE="$SSH_DERIVED_PUBLIC_KEY"
+elif [ "${FPRO_SSH_GENERATE:-0}" = "1" ]; then
+    SSH_KEY_DIR="$TMP/generated-ssh"
+    mkdir -p "$SSH_KEY_DIR"
+    SSH_PRIVATE_KEY_PATH="$SSH_KEY_DIR/$SSH_KEY_NAME"
+    SSH_GENERATED_KEY_PASSPHRASE="${FPRO_SSH_KEY_PASSPHRASE:-}"
+    if ! ssh-keygen -q -t ed25519 -N "${FPRO_SSH_KEY_PASSPHRASE:-}" \
+            -C "$SSH_KEY_NAME" -f "$SSH_PRIVATE_KEY_PATH"; then
+        die "SSH 密钥生成失败。"
+    fi
+    SSH_PUBLIC_KEY_SOURCE="$SSH_PRIVATE_KEY_PATH.pub"
+    SSH_KEY_GENERATED=1
+elif [ -f "$PAYLOAD_PRIVATE_KEY" ]; then
+    SSH_PRIVATE_KEY_PATH="$PAYLOAD_PRIVATE_KEY"
+    SSH_DERIVED_PUBLIC_KEY="$TMP/authorized_keys.from-payload-private"
+    derive_public_key "$SSH_PRIVATE_KEY_PATH" "$SSH_DERIVED_PUBLIC_KEY"
+    SSH_PUBLIC_KEY_SOURCE="$SSH_DERIVED_PUBLIC_KEY"
+else
+    SSH_PUBLIC_KEY_SOURCE="$PAY/ssh/authorized_keys"
+fi
+
+validate_authorized_keys "$SSH_PUBLIC_KEY_SOURCE"
+SSH_KEY_FINGERPRINT="$(key_fingerprint_from_file "$SSH_PUBLIC_KEY_SOURCE")"
+[ -n "$SSH_KEY_FINGERPRINT" ] || die "无法计算 SSH 公钥指纹：$SSH_PUBLIC_KEY_SOURCE"
+
+# 若同时给了私钥和显式公钥，强制校验二者确实是一对，避免部署成功后
+# 才发现 root 无法登录。
+if [ -n "$SSH_EXPLICIT_PRIVATE" ] && [ -n "$SSH_EXPLICIT_PUBLIC" -o -n "$SSH_INLINE_PUBLIC" ]; then
+    PRIVATE_FINGERPRINT="$(key_fingerprint_from_file "$SSH_DERIVED_PUBLIC_KEY")"
+    [ "$PRIVATE_FINGERPRINT" = "$SSH_KEY_FINGERPRINT" ] \
+        || die "SSH 公钥与 FPRO_SSH_PRIVATE_KEY 不匹配。"
+fi
+
+AUTHORIZED_KEYS_TARGET=/root/.ssh/authorized_keys
+touch "$AUTHORIZED_KEYS_TARGET"
+while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in
+        ""|\#*) continue ;;
+    esac
+    if ! grep -Fqx -- "$line" "$AUTHORIZED_KEYS_TARGET" 2>/dev/null; then
+        printf '%s\n' "$line" >> "$AUTHORIZED_KEYS_TARGET"
+    fi
+done < "$SSH_PUBLIC_KEY_SOURCE"
+chown root:root "$AUTHORIZED_KEYS_TARGET"
+chmod 600 "$AUTHORIZED_KEYS_TARGET"
+
+export_ssh_key_bundle() {
+    local requested="${FPRO_SSH_EXPORT:-0}" export_pass dest dest_dir safe_fp key_tar stage_dir
+    [ "$SSH_KEY_GENERATED" = "1" ] && requested="${FPRO_SSH_EXPORT:-1}"
+    [ -n "$SSH_RECEIVER_URL" ] && requested="1"
+    [ "$requested" = "1" ] || return 0
+    [ -n "$SSH_PRIVATE_KEY_PATH" ] || die "请求导出 SSH 私钥，但当前没有可导出的私钥。"
+
+    export_pass="${FPRO_SSH_EXPORT_PASSWORD:-$PASS}"
+    [ -n "$export_pass" ] || die "SSH 私钥导出密码为空。"
+    safe_fp="${SSH_KEY_FINGERPRINT//:/_}"
+    safe_fp="${safe_fp//\//_}"
+    dest="${FPRO_SSH_EXPORT_PATH:-}"
+    if [ -z "$dest" ]; then
+        # Receiver mode keeps the encrypted bundle only in TMP; it is removed
+        # after the one-shot transfer and never appears in the shared workspace.
+        if [ -n "$SSH_RECEIVER_URL" ]; then
+            dest="$TMP/${SSH_KEY_NAME}-${safe_fp}.tar.gz.enc"
+        elif [ -d "$DIR" ] && [ -w "$DIR" ]; then
+            dest="$DIR/${SSH_KEY_NAME}-${safe_fp}.tar.gz.enc"
+        else
+            dest="/tmp/${SSH_KEY_NAME}-${safe_fp}.tar.gz.enc"
+        fi
+    fi
+    case "$dest" in
+        ""|/|.) die "FPRO_SSH_EXPORT_PATH 不安全或为空。" ;;
+    esac
+    dest_dir="$(dirname "$dest")"
+    mkdir -p "$dest_dir" || die "无法创建 SSH 私钥导出目录：$dest_dir"
+    key_tar="$TMP/${SSH_KEY_NAME}.tar.gz"
+    stage_dir="$TMP/ssh-export"
+    mkdir -p "$stage_dir"
+    cp "$SSH_PRIVATE_KEY_PATH" "$stage_dir/$SSH_KEY_NAME"
+    cp "$SSH_PUBLIC_KEY_SOURCE" "$stage_dir/$SSH_KEY_NAME.pub"
+    chmod 600 "$stage_dir/$SSH_KEY_NAME"
+    chmod 644 "$stage_dir/$SSH_KEY_NAME.pub"
+    tar -czf "$key_tar" -C "$stage_dir" "$SSH_KEY_NAME" "$SSH_KEY_NAME.pub"
+    printf '%s\n' "$export_pass" | openssl enc -aes-256-cbc -pbkdf2 \
+        -in "$key_tar" -out "$dest" -pass stdin 2>/dev/null \
+        || die "SSH 私钥加密导出失败：$dest"
+    chmod 600 "$dest"
+    # sudo 场景下把加密导出文件交给实际操作者，便于从 Cloud Studio
+    # 工作区下载；如果无法解析 SUDO_USER，保持 root 所有权并提示手动复制。
+    if [ -n "${SUDO_USER:-}" ] && id "$SUDO_USER" >/dev/null 2>&1; then
+        chown "$SUDO_USER:$(id -gn "$SUDO_USER")" "$dest" 2>/dev/null || true
+    fi
+    SSH_KEY_EXPORT_PATH="$dest"
+}
+
+sha256_path() {
+    local path="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$path" | awk '{print $1; exit}'
+    else
+        openssl dgst -sha256 -r "$path" | awk '{print $1; exit}'
+    fi
+}
+
+send_ssh_key_bundle() {
+    [ -n "$SSH_RECEIVER_URL" ] || return 0
+    [ -s "$SSH_KEY_EXPORT_PATH" ] || die "SSH 私钥加密包不存在，无法交付。"
+    local digest="$1" response
+    echo "[*] 将加密 SSH 私钥包发送到一次性本机接收器 ..."
+
+    # Python avoids putting the transfer token in the process command line.
+    # The token is read from the inherited environment and is never printed.
+    if command -v python3 >/dev/null 2>&1; then
+        if ! FPRO_SSH_RECEIVER_URL="$SSH_RECEIVER_URL" \
+            FPRO_SSH_RECEIVER_TOKEN="$SSH_RECEIVER_TOKEN" \
+            FPRO_SSH_RECEIVER_TIMEOUT="$SSH_RECEIVER_TIMEOUT" \
+            python3 - "$SSH_KEY_EXPORT_PATH" "$digest" "$SSH_KEY_FINGERPRINT" <<'PY'
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+path, digest, fingerprint = sys.argv[1:4]
+url = os.environ["FPRO_SSH_RECEIVER_URL"]
+token = os.environ["FPRO_SSH_RECEIVER_TOKEN"]
+timeout = float(os.environ.get("FPRO_SSH_RECEIVER_TIMEOUT", "60"))
+with open(path, "rb") as stream:
+    body = stream.read()
+request = urllib.request.Request(
+    url,
+    data=body,
+    method="POST",
+    headers={
+        "Content-Type": "application/octet-stream",
+        "Content-Length": str(len(body)),
+        "X-FPRO-Transfer-Token": token,
+        "X-FPRO-SHA256": digest,
+        "X-FPRO-Key-Fingerprint": fingerprint,
+        "Connection": "close",
+    },
+)
+try:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        result = response.read(4096).decode("utf-8", "replace")
+        if response.status < 200 or response.status >= 300:
+            raise RuntimeError(f"HTTP {response.status}")
+        try:
+            parsed = json.loads(result)
+        except Exception:
+            parsed = {}
+        if parsed.get("ok") is not True:
+            raise RuntimeError("receiver rejected bundle")
+except urllib.error.HTTPError as exc:
+    raise SystemExit(f"receiver HTTP {exc.code}")
+except Exception as exc:
+    raise SystemExit(f"receiver request failed: {exc}")
+PY
+        then
+            SSH_KEY_DELIVERED=1
+            if [ "${FPRO_SSH_KEEP_EXPORT:-0}" != "1" ]; then
+                rm -f -- "$SSH_KEY_EXPORT_PATH"
+                SSH_KEY_EXPORT_PATH=""
+            fi
+            echo "[+] 加密 SSH 私钥包已由本机接收器接收并解密。"
+            return 0
+        fi
+    elif command -v curl >/dev/null 2>&1; then
+        # Minimal fallback for images without Python.  The token is still only
+        # used for this short-lived process and the payload remains encrypted.
+        if curl --fail --silent --show-error --max-time "$SSH_RECEIVER_TIMEOUT" \
+            --proto '=http,https' \
+            -H "Content-Type: application/octet-stream" \
+            -H "X-FPRO-Transfer-Token: $SSH_RECEIVER_TOKEN" \
+            -H "X-FPRO-SHA256: $digest" \
+            -H "X-FPRO-Key-Fingerprint: $SSH_KEY_FINGERPRINT" \
+            --data-binary "@$SSH_KEY_EXPORT_PATH" "$SSH_RECEIVER_URL" \
+            >/dev/null; then
+            SSH_KEY_DELIVERED=1
+            if [ "${FPRO_SSH_KEEP_EXPORT:-0}" != "1" ]; then
+                rm -f -- "$SSH_KEY_EXPORT_PATH"
+                SSH_KEY_EXPORT_PATH=""
+            fi
+            echo "[+] 加密 SSH 私钥包已由本机接收器接收。"
+            return 0
+        fi
+    else
+        echo "[-] 接收器交付需要 python3 或 curl。" >&2
+    fi
+    return 1
+}
+
+preserve_failed_ssh_export() {
+    [ -n "$SSH_KEY_EXPORT_PATH" ] && [ -f "$SSH_KEY_EXPORT_PATH" ] || return 0
+    local fallback="${FPRO_SSH_FALLBACK_PATH:-$DIR/${SSH_KEY_NAME}-$(sha256_path "$SSH_PUBLIC_KEY_SOURCE").tar.gz.enc}"
+    if [ "$fallback" = "$SSH_KEY_EXPORT_PATH" ]; then
+        return 0
+    fi
+    if cp "$SSH_KEY_EXPORT_PATH" "$fallback" 2>/dev/null; then
+        chmod 600 "$fallback" 2>/dev/null || true
+        echo "[!] 自动接收失败，已保留加密包（仍需手动取回）: $fallback" >&2
+    else
+        echo "[!] 自动接收失败，且无法保留加密包；请检查接收器状态后重试。" >&2
+    fi
+}
+
+export_ssh_key_bundle
+unset PASS
+
+mkdir -p /etc/ssh/sshd_config.d
+cp "$PAY/sshd_config.d/90-ragp.conf" /etc/ssh/sshd_config.d/90-ragp.conf
+chmod 644 /etc/ssh/sshd_config.d/90-ragp.conf
 
 mkdir -p /run/sshd
 if ! "$SSHD_BIN" -t; then
@@ -323,6 +683,17 @@ else
     echo "[+] sshd 已在运行"
 fi
 
+echo "[+] root SSH 公钥指纹: $SSH_KEY_FINGERPRINT"
+if [ -n "$SSH_KEY_EXPORT_PATH" ]; then
+    echo "[+] SSH 私钥已生成并加密导出: $SSH_KEY_EXPORT_PATH"
+    echo "    请把该 .enc 文件下载到本地，用同一解压密码解密后再连接。"
+elif [ -n "$SSH_PRIVATE_KEY_PATH" ]; then
+    echo "[+] 已确认提供了匹配的 SSH 私钥: $SSH_PRIVATE_KEY_PATH"
+else
+    echo "[!] 当前只安装了 SSH 公钥；端口响应不代表你已经拥有登录私钥。"
+    echo "    请使用与上述指纹匹配的本地私钥，或重跑时设置 FPRO_SSH_GENERATE=1。"
+fi
+
 # ---- 6. 拉起看门狗 ---------------------------------------------------------
 echo "[*] 启动 fpro-client 看门狗 ..."
 nohup /opt/fpro-client/watchdog.sh >>/var/log/fpro-watchdog.log 2>&1 &
@@ -331,7 +702,7 @@ sleep 4
 if ! kill -0 "$watchdog_pid" 2>/dev/null; then
     # 兼容极短暂的 bash→后台进程切换：只要已有看门狗实例接管锁，
     # 就视为启动成功；否则才报告失败。
-    if pgrep -f -- "$WATCHDOG_PATTERN" >/dev/null 2>&1; then
+    if [ -n "$(list_watchdog_pids)" ]; then
         echo "[+] 看门狗已由现有实例接管"
     else
         echo "[-] 看门狗启动失败，请查看 /var/log/fpro-watchdog.log" >&2
@@ -355,37 +726,92 @@ TUNNEL_PORT="${FPRO_TUNNEL_PORT:-$(read_toml_scalar remotePort "$PAY/fpro-client
 [[ "$TUNNEL_PORT" =~ ^[0-9]+$ ]] || die "无法从加密配置读取有效的 remotePort。"
 [[ "$TUNNEL_HOST" =~ ^[A-Za-z0-9._:-]+$ ]] || die "加密配置中的 serverAddr 格式无效。"
 
-# 如果调用方提供了对应的 SSH 私钥，则执行完整的登录验证。密钥不属于
-# 部署载荷，也不会被写入仓库；通过 FPRO_TUNNEL_SSH_KEY 临时传入即可。
-declare -a SSH_SELFTEST_ARGS=()
-if [ -n "${FPRO_TUNNEL_SSH_KEY:-}" ]; then
-    [ -f "$FPRO_TUNNEL_SSH_KEY" ] || die "FPRO_TUNNEL_SSH_KEY 不存在：$FPRO_TUNNEL_SSH_KEY"
-    SSH_SELFTEST_ARGS=(-i "$FPRO_TUNNEL_SSH_KEY" -o IdentitiesOnly=yes)
+# 端口探测是默认成功标准：映射未建立时，frps 的远端端口应不会响应。
+# 优先使用 nc；没有 nc 时使用 timeout + Bash /dev/tcp；两者都没有时，
+# 使用 Bash 子进程和短轮询实现无额外依赖的超时控制。
+probe_tunnel_port() {
+    local host="$1" port="$2" probe_pid i
+    if command -v nc >/dev/null 2>&1; then
+        nc -z -w 8 "$host" "$port" >/dev/null 2>&1
+        return $?
+    fi
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 8 bash -c 'exec 3<>/dev/tcp/$1/$2' _ "$host" "$port" \
+            >/dev/null 2>&1
+        return $?
+    fi
+    (exec 3<>"/dev/tcp/$host/$port") >/dev/null 2>&1 &
+    probe_pid=$!
+    for ((i = 0; i < 32; i++)); do
+        if ! kill -0 "$probe_pid" 2>/dev/null; then
+            if wait "$probe_pid"; then
+                return 0
+            else
+                return $?
+            fi
+        fi
+        sleep 0.25
+    done
+    kill "$probe_pid" 2>/dev/null || true
+    wait "$probe_pid" 2>/dev/null || true
+    return 124
+}
+
+echo "[*] 检查隧道端口 ..."
+if probe_tunnel_port "$TUNNEL_HOST" "$TUNNEL_PORT"; then
+    echo "[+] 隧道端口已响应（端口探测通过）"
+else
+    echo "[-] 隧道端口未响应，请确认 fpro-client 已连接且映射已建立。" >&2
+    exit 1
 fi
 
-# 没有私钥时，ssh 仍会完成 TCP/SSH 握手并返回 publickey 认证提示。将这种
-# 情况视为“隧道端口已响应但无法在容器内完成登录”，避免 Cloud Studio 等
-# 没有用户私钥的环境被误报为安装失败；其它连接错误仍然使安装失败。
-TUNNEL_TEST_OUT="$TMP/tunnel-selftest.out"
-TUNNEL_TEST_ERR="$TMP/tunnel-selftest.err"
-ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=6 -o BatchMode=yes \
-    "${SSH_SELFTEST_ARGS[@]}" -p "$TUNNEL_PORT" "root@$TUNNEL_HOST" \
-    'echo TUNNEL_OK' >"$TUNNEL_TEST_OUT" 2>"$TUNNEL_TEST_ERR" || true
-if grep -qx 'TUNNEL_OK' "$TUNNEL_TEST_OUT"; then
-    echo "[+] 隧道已打通：SSH 登录自检通过"
-elif grep -Eiq 'Permission denied \((publickey|keyboard-interactive|publickey,password)|No more authentication methods to try' "$TUNNEL_TEST_ERR"; then
-    if [ -n "${FPRO_TUNNEL_SSH_KEY:-}" ] || [ "${FPRO_TUNNEL_REQUIRE_SSH:-0}" = "1" ]; then
-        echo "[-] 隧道已响应，但 SSH 私钥认证失败。" >&2
+if [ -n "$SSH_RECEIVER_URL" ]; then
+    SSH_BUNDLE_DIGEST="$(sha256_path "$SSH_KEY_EXPORT_PATH")"
+    if ! send_ssh_key_bundle "$SSH_BUNDLE_DIGEST"; then
+        preserve_failed_ssh_export
+        die "SSH 私钥自动交付失败；未继续报告部署完成。"
+    fi
+    # The token is no longer needed after the one-shot POST.  Remove it from
+    # the shell environment before the remaining diagnostics run.
+    unset SSH_RECEIVER_TOKEN
+fi
+
+# 如调用方提供对应的 SSH 私钥，可在端口探测通过后追加完整登录验证。
+# FPRO_SSH_GENERATE=1 时使用本次生成的临时私钥自动完成验证；私钥不会
+# 打印到终端，且脚本退出时会清理临时明文，只留下加密导出文件（若启用）。
+SELFTEST_KEY="${FPRO_TUNNEL_SSH_KEY:-}"
+if [ -z "$SELFTEST_KEY" ] && [ "$SSH_KEY_GENERATED" = "1" ] && [ -z "$SSH_GENERATED_KEY_PASSPHRASE" ]; then
+    SELFTEST_KEY="$SSH_PRIVATE_KEY_PATH"
+fi
+if [ -n "${FPRO_TUNNEL_SSH_KEY:-}" ] || \
+        { [ "$SSH_KEY_GENERATED" = "1" ] && [ -z "$SSH_GENERATED_KEY_PASSPHRASE" ]; } || \
+        [ -n "$SSH_EXPLICIT_PRIVATE" ] || [ "${FPRO_TUNNEL_REQUIRE_SSH:-0}" = "1" ]; then
+    [ -n "$SELFTEST_KEY" ] || die "严格 SSH 自检需要设置 FPRO_TUNNEL_SSH_KEY，或启用 FPRO_SSH_GENERATE=1。"
+    [ -f "$SELFTEST_KEY" ] || die "SSH 自检私钥不存在：$SELFTEST_KEY"
+    if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=6 -o BatchMode=yes \
+        -i "$SELFTEST_KEY" -o IdentitiesOnly=yes \
+        -p "$TUNNEL_PORT" "root@$TUNNEL_HOST" 'echo TUNNEL_OK' \
+        >/dev/null 2>&1; then
+        echo "[+] SSH 登录自检通过"
+    else
+        echo "[-] 隧道端口已响应，但 SSH 私钥认证失败。" >&2
         exit 1
     fi
-    echo "[!] 隧道端口已响应，但容器内没有可用 SSH 私钥；已跳过登录验证。"
-else
-    echo "[-] 隧道回环自检未通过（连接或 SSH 握手失败），请稍后重试：" >&2
-    echo "      ssh -p $TUNNEL_PORT root@$TUNNEL_HOST" >&2
-    exit 1
 fi
 
 echo "=========================================================="
 echo "  部署完成。"
-echo "  本机连接命令： ssh -p $TUNNEL_PORT root@$TUNNEL_HOST"
+if [ "$SSH_KEY_DELIVERED" = "1" ]; then
+    echo "  SSH 私钥已交付到本机接收器并完成本地解密。"
+    echo "  请使用接收器输出的私钥连接。"
+elif [ -n "$SSH_KEY_EXPORT_PATH" ]; then
+    echo "  请先在本机解密 SSH 私钥包，再连接："
+    echo "    ssh -i ~/.ssh/$SSH_KEY_NAME -p $TUNNEL_PORT root@$TUNNEL_HOST"
+elif [ -n "$SSH_PRIVATE_KEY_PATH" ]; then
+    echo "  本机请使用与指纹 $SSH_KEY_FINGERPRINT 匹配的私钥："
+    echo "    ssh -i <private-key> -p $TUNNEL_PORT root@$TUNNEL_HOST"
+else
+    echo "  本机请使用与指纹 $SSH_KEY_FINGERPRINT 匹配的私钥："
+    echo "    ssh -i <private-key> -p $TUNNEL_PORT root@$TUNNEL_HOST"
+fi
 echo "=========================================================="

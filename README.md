@@ -45,11 +45,12 @@ curl -fsSL https://raw.githubusercontent.com/bot0577/fpro-cloudstudio-deploy/mai
 `x86_64` 使用 `fpro-client_linux_amd64.b64.enc`，`aarch64` 使用
 `fpro-client_linux_arm64.b64.enc`。本地包和二进制存在时使用脚本同目录文件，否则自动使用默认 GitHub Raw 目录。
 
-安装末尾会进行隧道回环自检。如果运行环境中有对应的 SSH 私钥，可通过
-`FPRO_TUNNEL_SSH_KEY=/path/to/key` 让脚本完成登录验证；没有私钥时，脚本仍会
-验证远端端口和 SSH 握手已响应，并提示跳过登录验证，不会因此误报安装失败。
-在必须验证登录的自动化环境中设置 `FPRO_TUNNEL_REQUIRE_SSH=1`；此时未提供
-可用私钥会使安装失败。
+安装末尾会进行隧道端口自检：脚本探测加密配置中的远端端口，端口能建立
+TCP 连接即判定映射已响应。若要再做完整 SSH 登录验证，可设置
+`FPRO_TUNNEL_SSH_KEY=/path/to/key`；自动化环境也可设置
+`FPRO_TUNNEL_REQUIRE_SSH=1`，要求必须提供该私钥并通过登录验证。完全没有
+私钥时使用 `FPRO_SSH_GENERATE=1`，脚本会生成并导出一份加密的登录密钥，
+详见下方“SSH 登录密钥”。
 
 脚本可重复执行：重跑时会等待旧看门狗释放锁，再启动新实例。
 
@@ -119,10 +120,165 @@ manifest.json                 元数据
 
 服务端地址、认证 token 和证书身份由加密配置使用；README 不重复这些值。
 
+## SSH 登录密钥
+
+这里有两类完全不同的“私钥”：`certs/client.key` 是 fpro 客户端连接服务端
+用的 mTLS 私钥；SSH 登录 root 使用的是 `ssh/authorized_keys` 对应的另一对
+密钥。端口探测只能证明 TCP 映射有响应，不能替代 SSH 公钥认证。
+
+默认载荷只放 SSH **公钥**，不会凭空给操作者生成一个可找回的私钥。安装脚本
+会输出公钥指纹；你必须在本机保留与该指纹匹配的私钥，然后这样连接：
+
+```bash
+ssh -i ~/.ssh/fpro-cloudstudio -p <remote-port> root@<tunnel-host>
+```
+
+### 本机已有密钥
+
+把本机公钥作为 `FPRO_AUTHORIZED_KEYS_FILE` 传给安装脚本；如果同时提供私钥，
+脚本会先校验公钥/私钥指纹是否一致，再启动 sshd：
+
+```bash
+sudo env \
+  FPRO_AUTHORIZED_KEYS_FILE=/path/to/id_ed25519.pub \
+  FPRO_SSH_PRIVATE_KEY=/path/to/id_ed25519 \
+  FPRO_TUNNEL_SSH_KEY=/path/to/id_ed25519 \
+  bash install.sh
+```
+
+`FPRO_AUTHORIZED_KEYS_FILE` 指向的是**目标容器内**可读的文件；若密钥只在
+Windows/macOS 本机，先通过 Cloud Studio 文件上传或本地 provisioning 工具
+把 `.pub` 传入容器，再运行安装脚本。
+
+私钥只在操作者自己的电脑上使用，不会通过 Git、GitHub Raw 或 bridge 上传。
+
+### 完全没有密钥时
+
+在目标容器中显式启用一次性生成模式。脚本会生成 Ed25519 密钥，只把公钥加入
+`authorized_keys`，并用本次解压密码把私钥和公钥打成一个单独的加密导出文件：
+
+```bash
+sudo env FPRO_SSH_GENERATE=1 bash install.sh
+```
+
+默认导出文件为当前目录下的
+`fpro-cloudstudio-SHA256_<fingerprint>.tar.gz.enc`（当前目录不可写时落到
+`/tmp`）；也可以指定一个明确位置：
+
+```bash
+sudo env \
+  FPRO_SSH_GENERATE=1 \
+  FPRO_SSH_EXPORT_PATH=/workspace/fpro-cloudstudio-key.tar.gz.enc \
+  bash install.sh
+```
+
+把这个 `.enc` 文件下载到本机后，用**同一个解压密码**解开（不要把密码写进
+命令行或 Git 历史）：
+
+```bash
+mkdir -p ~/.ssh
+openssl enc -d -aes-256-cbc -pbkdf2 \
+  -in fpro-cloudstudio-key.tar.gz.enc -pass stdin \
+  | tar -xzf - -C ~/.ssh
+chmod 600 ~/.ssh/fpro-cloudstudio
+ssh -i ~/.ssh/fpro-cloudstudio -p <remote-port> root@<tunnel-host>
+```
+
+如果安装是直接以 root 登录容器、导出文件因此属于 root，可先在容器终端执行
+`sudo cp /path/to/fpro-cloudstudio-key.tar.gz.enc /workspace/`，再从工作区下载；
+不要把解密后的私钥放回共享工作区。
+
+导出文件只用于完成一次密钥交付；解密后应从共享工作区删除。若解压密码已经
+泄露，应立即重新生成一对密钥并重新部署公钥。也可以用
+`FPRO_SSH_EXPORT_PASSWORD` 为导出文件设置不同的密码（通过安全的环境注入，
+不要写入脚本）。
+
+若只是想在已有私钥的情况下生成一个加密备份，可设置
+`FPRO_SSH_EXPORT=1 FPRO_SSH_PRIVATE_KEY=/path/to/key`；脚本仍会先检查公钥
+指纹，且不会打印私钥内容。
+
+无论采用哪种方式，安装末尾的端口自检仍以 TCP 端口存活为默认成功标准；设置
+`FPRO_TUNNEL_REQUIRE_SSH=1` 才会要求同时提供私钥并完成一次真实 SSH 登录。
+
+### 通过一次性 fpro 通道自动接收（推荐）
+
+如果不想手动下载 `.enc` 文件，可以在操作者本机启动
+`tools/fpro_ssh_receiver.py`。它会在本机回环地址启动一次性 HTTP 接收器，
+再用临时的 fpro TCP 代理把一个未占用的远端端口转回该接收器。加密包抵达后，
+接收器在本机校验 SHA-256、SSH 指纹并解密安装私钥；解压密码从不通过网络发送。
+
+先在本机准备仅自己可读的 token、配置包密码和 mTLS 文件（这些文件不得提交到
+Git）：
+
+```text
+<receiver-token-file>       一次性随机 token
+<package-password-file>     fpro-deploy.tar.gz.enc 的密码
+<client.crt> <client.key> <ca.crt>    临时 fpro 客户端的 TLS 材料
+```
+
+然后在仓库根目录启动代理；`<unused-remote-port>` 必须是服务端允许且当前未被
+占用的端口：
+
+```bash
+python tools/fpro_ssh_receiver.py proxy \
+  --fpro-binary <path-to-fpro-client> \
+  --server-addr <fpro-server-host> \
+  --server-port <fpro-control-port> \
+  --remote-port <unused-remote-port> \
+  --tls-cert <path-to-client.crt> \
+  --tls-key <path-to-client.key> \
+  --tls-ca <path-to-ca.crt> \
+  --tls-server-name <tls-server-name> \
+  --token-file <receiver-token-file> \
+  --password-file <package-password-file> \
+  --ssh-dir ~/.ssh \
+  --key-name fpro-cloudstudio
+```
+
+工具会先用带 token 的 `/healthz` 请求确认完整 HTTP 路径可用，不使用会占用
+首个 work connection 的裸 TCP 探测。启动后它会打印本次临时通道的 URL 和 token；
+只在目标容器的当前进程环境中使用它们：
+
+```bash
+sudo env \
+  FPRO_SSH_GENERATE=1 \
+  FPRO_SSH_RECEIVER_URL="http://<fpro-server-host>:<unused-remote-port>/v1/ssh-key" \
+  FPRO_SSH_RECEIVER_TOKEN="<one-time-token>" \
+  bash install.sh
+```
+
+若不希望 token 出现在容器 shell 命令行，可将它暂存到容器内权限为 `600` 的
+临时文件，并改用 `FPRO_SSH_RECEIVER_TOKEN_FILE=/path/to/token`；安装结束后
+删除该文件。临时 token 文件不要放进 Git 或共享工作区。
+
+默认情况下，容器端输入的配置包密码必须与本机 `--password-file` 内容相同；如果
+设置了 `FPRO_SSH_EXPORT_PASSWORD`，则 `--password-file` 应填写这个单独的导出密码。
+安装脚本会把
+临时生成的 SSH 私钥打成单独的加密包并 POST 到上述端点；本机接收器收到并验证
+后自动解密写入 `--ssh-dir`，随后临时 fpro 客户端自动退出。成功时无需下载文件；
+失败时安装脚本不会报告部署完成，并尽量保留加密包供排障。`--response-grace`
+可按网络状况调整（默认 3 秒），不需要长期开放接收端口。
+
+本地接收器也可单独处理已经取得的包：
+
+```bash
+python tools/fpro_ssh_receiver.py decrypt \
+  --input fpro-cloudstudio-key.tar.gz.enc \
+  --password-file <package-password-file> \
+  --ssh-dir ~/.ssh
+```
+
+接收器默认只绑定 `127.0.0.1`，使用一次性随机 token、大小限制、路径穿越/软链接
+检查、私钥与 `.pub` 匹配检查以及原子写入。只有明确指定 `--allow-public` 才会
+允许监听非回环地址；即使如此，仍应依赖 fpro TLS、随机 token 和加密包密码共同
+保护传输。
+
 ## 安全约定
 
 - 每个二进制文件单独使用 AES-256-CBC + PBKDF2 加密，文件名保留平台信息。
 - Git 只提交脚本、文档和 `.enc` 文件；明文 `payload/`、私钥、auth token 与 bridge 配置不得明文提交。
+- `FPRO_SSH_GENERATE=1` 生成的私钥只会短暂存在于容器临时目录，随后写入
+  密码保护的 `.tar.gz.enc`；解密后的私钥应立即移到本机并删除导出文件。
 - 本地 bridge 配置只供本机连接使用，不属于部署载荷，也不上传到仓库。
 - 仓库可以公开：真实服务地址、证书身份、客户端私钥、auth token 和 bridge 配置只允许存在于加密载荷或运行时安全存储中。解密密码不写入命令行、脚本或 Git 历史。
 - 解密后的临时文件由安装脚本在退出时清理；运行中的配置文件仍应按主机权限保护。
