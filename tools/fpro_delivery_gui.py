@@ -335,7 +335,8 @@ def make_remote_command(
 
     The first prompt captures the package password into a temporary file; the
     second captures the one-shot receiver token.  Neither secret appears in
-    shell history or the command text.
+    shell history or the command text.  The packaged GUI normally fills both
+    prompts through CDP, so the operator only enters one password in the app.
     """
     if not KEY_NAME_RE.fullmatch(key_name):
         raise AppError("SSH 密钥名只能包含字母、数字、点、下划线和连字符。")
@@ -347,7 +348,7 @@ def make_remote_command(
     )
     return (
         "set -o pipefail; umask 077; "
-        "printf '\\n配置包密码: '; read -r -s FPRO_PACKAGE_PASSWORD; "
+        "printf '\\n密钥传输密码（配置包密码）: '; read -r -s FPRO_PACKAGE_PASSWORD; "
         "printf '%s' \"$FPRO_PACKAGE_PASSWORD\" >/tmp/fpro-package-password; "
         "unset FPRO_PACKAGE_PASSWORD; "
         "printf '\\n一次性接收 token: '; read -r -s FPRO_TRANSFER_TOKEN; "
@@ -453,16 +454,16 @@ class DeliveryApp(tk.Tk):
         ttk.Label(outer, text="fpro Cloud Studio 一键 SSH 密钥交付", font=("Segoe UI", 16, "bold")).pack(anchor="w")
         ttk.Label(
             outer,
-            text="通常只需输入配置包密码并点击“开始一键部署”；程序会自动下载、解密、传输并保存 SSH 私钥。",
+            text="只需填写一个密钥传输密码并点击“开始一键部署”；其余参数和临时 token 由程序自动处理。",
             foreground="#555555",
         ).pack(anchor="w", pady=(2, 12))
 
         form = ttk.LabelFrame(outer, text="部署参数", padding=10)
         form.pack(fill="x")
-        self.add_row(form, 0, "配置包密码（不保存）", "password", None)
+        self.add_row(form, 0, "密钥传输密码（唯一必填）", "password", None)
         ttk.Label(
             form,
-            text="临时端口、浏览器自动输入等已自动处理；通常无需修改高级设置。",
+            text="该密码同时用于解密配置和接收的 SSH 私钥包；不会保存到设置文件。",
             foreground="#777777",
         ).grid(row=1, column=1, sticky="w", pady=(2, 0))
 
@@ -506,10 +507,29 @@ class DeliveryApp(tk.Tk):
         self.start_button.pack(side="left")
         self.stop_button = ttk.Button(buttons, text="停止", command=self.stop, state="disabled")
         self.stop_button.pack(side="left", padx=(8, 0))
-        self.copy_button = ttk.Button(buttons, text="复制 Cloud Studio 指令", command=self.copy_command, state="disabled")
-        self.copy_button.pack(side="left", padx=(8, 0))
+
+        # Keep manual fallback controls out of the normal one-field workflow.
+        # They are revealed only when CDP auto input is unavailable (or when
+        # the operator explicitly disables auto input in Advanced settings).
+        self.fallback_frame = ttk.LabelFrame(
+            outer, text="仅在自动输入失败时使用", padding=8
+        )
+        ttk.Label(
+            self.fallback_frame,
+            text="正常情况下无需复制命令或 token。若浏览器 CDP 不可用，再按下面按钮操作。",
+            foreground="#777777",
+        ).pack(anchor="w")
+        fallback_buttons = ttk.Frame(self.fallback_frame)
+        fallback_buttons.pack(fill="x", pady=(6, 0))
+        self.copy_button = ttk.Button(
+            fallback_buttons,
+            text="复制 Cloud Studio 指令",
+            command=self.copy_command,
+            state="disabled",
+        )
+        self.copy_button.pack(side="left")
         self.copy_token_button = ttk.Button(
-            buttons,
+            fallback_buttons,
             text="复制一次性 token",
             command=self.copy_token,
             state="disabled",
@@ -517,7 +537,8 @@ class DeliveryApp(tk.Tk):
         self.copy_token_button.pack(side="left", padx=(8, 0))
 
         self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(outer, textvariable=self.status_var, foreground="#1f5f9e").pack(anchor="w")
+        self.status_label = ttk.Label(outer, textvariable=self.status_var, foreground="#1f5f9e")
+        self.status_label.pack(anchor="w")
         log_frame = ttk.LabelFrame(outer, text="运行日志", padding=6)
         log_frame.pack(fill="both", expand=True, pady=(6, 0))
         self.log_text = tk.Text(log_frame, height=14, wrap="word", state="disabled", font=("Consolas", 9))
@@ -526,6 +547,21 @@ class DeliveryApp(tk.Tk):
         self.log_text.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         self.password_entry.focus_set()
+        self.password_entry.bind("<Return>", lambda _event: self.start())
+
+    def show_manual_fallback(self) -> None:
+        """Reveal the manual controls only when the automatic path needs them."""
+        if not self.current_url:
+            return
+        if not self.fallback_frame.winfo_manager():
+            self.fallback_frame.pack(fill="x", pady=(6, 0), before=self.status_label)
+        self.copy_button.configure(state="normal" if self.current_url else "disabled")
+        self.copy_token_button.configure(state="normal" if self.current_token else "disabled")
+
+    def hide_manual_fallback(self) -> None:
+        self.fallback_frame.pack_forget()
+        self.copy_button.configure(state="disabled")
+        self.copy_token_button.configure(state="disabled")
 
     def toggle_advanced(self) -> None:
         if self.advanced_frame.winfo_manager():
@@ -594,6 +630,8 @@ class DeliveryApp(tk.Tk):
                     self.status_var.set(str(value))
                 elif event == "ready":
                     self.on_proxy_ready()
+                elif event == "fallback":
+                    self.show_manual_fallback()
                 elif event == "done":
                     self.on_worker_done(int(value))
                 elif event == "error":
@@ -639,7 +677,7 @@ class DeliveryApp(tk.Tk):
                 raise AppError("临时远端端口必须在 1-65535 范围内。")
         password = self.password_entry.get()
         if not password:
-            raise AppError("请输入配置包密码。")
+            raise AppError("请输入密钥传输密码。")
         key_name = self.key_name_var.get().strip() or KEY_NAME_DEFAULT
         if not KEY_NAME_RE.fullmatch(key_name):
             raise AppError("SSH 密钥名只能包含字母、数字、点、下划线和连字符。")
@@ -656,7 +694,7 @@ class DeliveryApp(tk.Tk):
         self.save_settings()
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
-        self.copy_button.configure(state="disabled")
+        self.hide_manual_fallback()
         self.proxy_ready = False
         self.current_token = ""
         self.current_url = ""
@@ -881,8 +919,10 @@ class DeliveryApp(tk.Tk):
         self.clipboard_clear()
         self.clipboard_append(command)
         self.update()
-        self.copy_button.configure(state="normal")
-        self.copy_token_button.configure(state="normal")
+        # Keep the normal path to one visible input.  Manual controls are
+        # revealed only if CDP cannot complete the automatic terminal input.
+        self.copy_button.configure(state="disabled")
+        self.copy_token_button.configure(state="disabled")
         self.status_var.set("临时通道已建立，正在等待 Cloud Studio 安装…")
         self.log("临时通道已建立；安装指令已复制到剪贴板。")
         if assets.auto_cdp:
@@ -892,6 +932,7 @@ class DeliveryApp(tk.Tk):
                 daemon=True,
             ).start()
         else:
+            self.show_manual_fallback()
             self.log("请在 Cloud Studio 终端粘贴指令；密码按你刚才输入的值填写，token 可点击“复制一次性 token”后粘贴。")
 
     def copy_command(self) -> None:
@@ -981,7 +1022,7 @@ class DeliveryApp(tk.Tk):
                     raise AppError("找到了浏览器页面，但无法聚焦终端。")
                 self.cdp_insert(connection, command)
                 self.cdp_enter(connection)
-                if not self.cdp_wait_for_text(connection, "配置包密码", timeout=12):
+                if not self.cdp_wait_for_text(connection, "密钥传输密码", timeout=12):
                     self.post("log", "未读到密码提示，按短暂等待继续输入。")
                     time.sleep(1.0)
                 self.cdp_insert(connection, password)
@@ -996,6 +1037,7 @@ class DeliveryApp(tk.Tk):
                 connection.close()
         except Exception as exc:
             self.post("log", f"CDP 自动执行未完成：{exc}")
+            self.post("fallback")
             self.post("log", "已保留指令在剪贴板；如需继续，请在 Cloud Studio 终端粘贴一次。")
 
     @staticmethod
@@ -1055,8 +1097,7 @@ class DeliveryApp(tk.Tk):
         self.worker = None
         self.stop_button.configure(state="disabled")
         self.start_button.configure(state="normal")
-        self.copy_button.configure(state="disabled")
-        self.copy_token_button.configure(state="disabled")
+        self.hide_manual_fallback()
         if code == 0:
             self.status_var.set("完成：SSH 私钥已写入本机")
             self.log("一次性通道已关闭；请使用 ~/.ssh 中的私钥连接实际 SSH 映射端口。")
@@ -1086,8 +1127,7 @@ class DeliveryApp(tk.Tk):
                     pass
         self.stop_button.configure(state="disabled")
         self.start_button.configure(state="normal")
-        self.copy_button.configure(state="disabled")
-        self.copy_token_button.configure(state="disabled")
+        self.hide_manual_fallback()
         self.cleanup_temp()
         self.current_password = ""
 

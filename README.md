@@ -11,10 +11,10 @@ Cloud Studio 容器重启后，容器内的 `fpro-client`、`sshd` 和隧道进�
 ## Windows 操作者：优先使用一键 EXE
 
 构建后生成 `dist/FProCloudStudio.exe`。Windows 操作者通常只需双击该文件，
-输入一次配置包密码并点击“开始一键部署”；程序会按本机架构下载加密客户端，
+只输入一次“密钥传输密码”并点击“开始一键部署”；这是唯一必填项，程序会按本机架构下载加密客户端，
 解密配置、启动临时 fpro 通道，自动向已打开的 Cloud Studio 终端执行安装，
 再接收并解密 SSH 私钥到 `%USERPROFILE%\.ssh`。没有 Chrome CDP 时，程序会
-把后备指令复制到剪贴板。
+把后备指令复制到剪贴板并显示手动兜底按钮；正常路径无需填写端口、服务器地址或 token。
 
 EXE 内置解密和密钥校验逻辑，不要求另外安装 Python 或 OpenSSL；网络访问和
 Cloud Studio 登录仍须由操作者提供。构建命令及高级/手动流程见
