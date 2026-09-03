@@ -1117,6 +1117,10 @@ def run_worker(argv: list[str]) -> int:
 
 def self_test() -> int:
     """Non-GUI smoke checks used by the build/CI script."""
+    try:
+        import websocket  # noqa: F401 - verify the packaged CDP dependency
+    except ImportError as exc:
+        raise AssertionError(f"websocket CDP dependency is missing: {exc}") from exc
     assert windows_binary_name().startswith("fpro-client_windows_")
     assert select_temp_port(None, 7022) == 7023
     assert select_temp_port(None, 22) == DEFAULT_TEMP_PORT_MIN
