@@ -62,10 +62,68 @@ TOKEN_RE = re.compile(r"^[A-Za-z0-9._~-]{16,256}$")
 KEY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,96}$")
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 FINGERPRINT_RE = re.compile(r"^SHA256:[A-Za-z0-9+/=_-]+$")
+# An ASCII-only event line lets the Windows GUI detect readiness without
+# depending on the active system code page.  The human-readable Chinese line
+# is still emitted for standalone CLI users.
+READY_MARKER = "__FPRO_EVENT_READY__"
 
 
 class ReceiverError(RuntimeError):
     """A user-actionable validation or transport error."""
+
+
+def decode_text(data: bytes, *, limit: int | None = None) -> str:
+    """Decode subprocess/network text across UTF-8 and Windows code pages.
+
+    The packaged GUI talks to a child process through a pipe.  On Windows a
+    child launched without an explicit encoding can still use CP936, while
+    Cloud Studio/fpro normally emits UTF-8.  Prefer UTF-8 and fall back to
+    GB18030 when UTF-8 is invalid or would contain replacement characters.
+    This keeps diagnostics readable without changing the on-disk protocol.
+    """
+    if limit is not None:
+        data = data[:limit]
+    if not data:
+        return ""
+    for encoding in ("utf-8", "gb18030"):
+        try:
+            text = data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        if "\ufffd" not in text:
+            return text
+    return data.decode("utf-8", "replace")
+
+
+def read_text_tail(path: pathlib.Path, max_bytes: int = 8192, max_chars: int = 2000) -> str:
+    """Read a bounded, correctly decoded tail of a diagnostic log."""
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - max_bytes), os.SEEK_SET)
+            data = stream.read(max_bytes)
+    except OSError:
+        return ""
+    return decode_text(data)[-max_chars:]
+
+
+def configure_stdio() -> None:
+    """Use UTF-8 for piped worker output while preserving interactive consoles."""
+    for stream in (getattr(sys, "stdout", None), getattr(sys, "stderr", None)):
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            if stream.isatty():
+                continue
+        except Exception:
+            # A few embedded streams do not implement isatty reliably; they
+            # are still safe to reconfigure for the worker protocol.
+            pass
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
 
 
 def fail(message: str) -> NoReturn:
@@ -151,9 +209,9 @@ def ssh_fingerprint(public_text: str) -> str:
             fail(f"SSH 公钥无效或当前环境缺少密钥解析支持：{python_error}")
         result = run_capture(["ssh-keygen", "-lf", "-"], input_bytes=public_text.encode())
         if result.returncode != 0:
-            detail = result.stderr.decode("utf-8", "replace").strip()
+            detail = decode_text(result.stderr).strip()
             fail(f"SSH 公钥无效：{detail[:300]}")
-        fields = result.stdout.decode("utf-8", "replace").split()
+        fields = decode_text(result.stdout).split()
         if len(fields) < 2:
             fail("ssh-keygen 没有返回公钥指纹。")
         return fields[1]
@@ -182,9 +240,9 @@ def derive_public(private_path: pathlib.Path, passphrase: str = "") -> str:
             ["ssh-keygen", "-y", "-P", passphrase, "-f", str(private_path)]
         )
         if result.returncode != 0:
-            detail = result.stderr.decode("utf-8", "replace").strip()
+            detail = decode_text(result.stderr).strip()
             fail(f"无法从 SSH 私钥导出公钥：{detail[:300]}")
-        public = result.stdout.decode("utf-8", "replace").strip()
+        public = decode_text(result.stdout).strip()
         if not key_line(public):
             fail("从 SSH 私钥导出的公钥为空。")
         return public + "\n"
@@ -765,7 +823,7 @@ def fetch_remote(args: argparse.Namespace) -> int:
         try:
             response = urllib.request.urlopen(request, timeout=args.timeout)
         except urllib.error.HTTPError as exc:
-            detail = exc.read(512).decode("utf-8", "replace")
+            detail = decode_text(exc.read(512), limit=512)
             fail(f"远端接收端点返回 HTTP {exc.code}: {detail}")
         with response:
             raw_length = response.headers.get("Content-Length")
@@ -861,7 +919,7 @@ def wait_for_health(host: str, port: int, token: str, timeout: float) -> bool:
                 if response.status != 200:
                     raise OSError(f"health HTTP {response.status}")
                 try:
-                    payload = json.loads(body.decode("utf-8", "replace"))
+                    payload = json.loads(decode_text(body))
                 except (TypeError, ValueError):
                     payload = {}
                 if payload.get("ok") is True and payload.get("ready") is True:
@@ -967,9 +1025,13 @@ def start_fpro_proxy(args: argparse.Namespace) -> int:
         if not wait_for_health(
             args.server_addr, args.remote_port, receiver_token, args.proxy_timeout
         ):
-            detail = log_file.read_text(encoding="utf-8", errors="replace")[-2000:]
+            detail = read_text_tail(log_file)
             fail(f"临时 fpro 端口未上线。客户端日志：{detail}")
         remote_url_host = url_host(args.server_addr)
+        # Emit an ASCII-only event before the localized status line.  The
+        # packaged GUI uses this marker so readiness detection remains correct
+        # even when a Windows code page is misconfigured.
+        print(READY_MARKER)
         print(f"临时 fpro 通道已建立: {remote_url_host}:{args.remote_port}")
         print(f"请将以下变量传给容器内 install.sh（token 不要写入 Git）：")
         print(f"FPRO_SSH_RECEIVER_URL=http://{remote_url_host}:{args.remote_port}{args.endpoint}")
@@ -978,7 +1040,7 @@ def start_fpro_proxy(args: argparse.Namespace) -> int:
         sys.stdout.flush()
         while not state.done.wait(0.25):
             if process.poll() is not None:
-                detail = log_file.read_text(encoding="utf-8", errors="replace")[-2000:]
+                detail = read_text_tail(log_file)
                 fail(f"临时 fpro 客户端提前退出。日志：{detail}")
         # Keep the fpro process alive until the response was flushed, then use
         # a short configurable grace period for the bytes to cross frps/frpc.
@@ -1112,6 +1174,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    # The GUI launches this module with stdout/stderr connected to a pipe.
+    # Force UTF-8 for that worker stream so Chinese diagnostics are not
+    # encoded with the host's legacy CP936 code page.  Interactive terminals
+    # retain their native encoding in ``configure_stdio``.
+    configure_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
     try:

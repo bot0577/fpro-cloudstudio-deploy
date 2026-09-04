@@ -60,6 +60,10 @@ KEY_NAME_DEFAULT = "fpro-cloudstudio"
 KEY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,96}$")
 DEFAULT_TEMP_PORT_MIN = 7001
 DEFAULT_TEMP_PORT_MAX = 7499
+# Keep this in sync with ``fpro_ssh_receiver.READY_MARKER``.  It is ASCII by
+# design, so readiness detection works even if a legacy Windows code page is
+# involved in the child process stream.
+WORKER_READY_MARKER = "__FPRO_EVENT_READY__"
 
 
 class AppError(RuntimeError):
@@ -133,6 +137,23 @@ def select_temp_port(requested: Optional[int], ssh_port: Optional[int]) -> int:
 def shell_quote(value: str) -> str:
     """Quote one value for POSIX shell commands typed into Cloud Studio."""
     return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def decode_worker_line(value: bytes | str) -> str:
+    """Decode one worker output line without Windows CP936 mojibake."""
+    if isinstance(value, str):
+        return value.rstrip("\r\n")
+    raw = value.rstrip(b"\r\n")
+    if not raw:
+        return ""
+    for encoding in ("utf-8", "gb18030"):
+        try:
+            text = raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        if "\ufffd" not in text:
+            return text
+    return raw.decode("utf-8", "replace")
 
 
 def url_host(host: str) -> str:
@@ -322,17 +343,19 @@ def make_remote_command(
     fetch_script = (
         f"if command -v curl >/dev/null 2>&1; then curl -fsSL {shell_quote(install_url)}; "
         f"elif command -v wget >/dev/null 2>&1; then wget -qO- {shell_quote(install_url)}; "
-        "else echo '需要 curl 或 wget' >&2; exit 127; fi"
+        "else echo 'curl or wget is required' >&2; exit 127; fi"
     )
     return (
         "set -o pipefail; umask 077; "
         "FPRO_PW_FILE=\"$(mktemp)\" || exit 1; "
         "FPRO_TOKEN_FILE=\"$(mktemp)\" || { rm -f -- \"$FPRO_PW_FILE\"; exit 1; }; "
         "trap 'rm -f -- \"$FPRO_PW_FILE\" \"$FPRO_TOKEN_FILE\"' EXIT HUP INT TERM; "
-        "printf '\\n密钥传输密码（配置包密码）: '; read -r -s FPRO_PACKAGE_PASSWORD; "
+        # Keep prompts ASCII: Cloud Studio terminals may use a different
+        # locale, and an ASCII command is never rendered as mojibake there.
+        "printf '\\nFPRO package password: '; read -r -s FPRO_PACKAGE_PASSWORD; "
         "printf '%s' \"$FPRO_PACKAGE_PASSWORD\" >\"$FPRO_PW_FILE\"; "
         "unset FPRO_PACKAGE_PASSWORD; "
-        "printf '\\n一次性接收 token: '; read -r -s FPRO_TRANSFER_TOKEN; "
+        "printf '\\nFPRO one-time transfer token: '; read -r -s FPRO_TRANSFER_TOKEN; "
         "printf '%s\\n' \"$FPRO_TRANSFER_TOKEN\" >\"$FPRO_TOKEN_FILE\"; "
         "unset FPRO_TRANSFER_TOKEN; "
         f"{fetch_script} | sudo env "
@@ -390,15 +413,19 @@ class DeliveryApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("820x690")
-        self.minsize(760, 580)
+        self.geometry("900x760")
+        self.minsize(760, 640)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
-        self.worker: Optional[subprocess.Popen[str]] = None
+        self.worker: Optional[subprocess.Popen[bytes]] = None
         self.worker_thread: Optional[threading.Thread] = None
         self.proxy_ready = False
         self.current_token = ""
         self.current_url = ""
+        self.current_command = ""
+        self.command_placeholder = (
+            "启动临时通道后，这里会自动生成一条可直接粘贴到 Cloud Studio 的 bash 命令。"
+        )
         self.prepared: Optional[PreparedAssets] = None
         self.temp_root: Optional[pathlib.Path] = None
         self.load_settings()
@@ -428,7 +455,7 @@ class DeliveryApp(tk.Tk):
         ttk.Label(outer, text="fpro Cloud Studio 临时通道与 SSH 密钥交付", font=("Segoe UI", 16, "bold")).pack(anchor="w")
         ttk.Label(
             outer,
-            text="输入密钥传输密码后点击开始；程序只建立本机临时通道并接收密钥，不会自动控制 Cloud Studio。",
+            text="输入密钥传输密码后点击开始；程序会自动生成并复制 Cloud Studio 的 bash 命令。",
             foreground="#555555",
         ).pack(anchor="w", pady=(2, 12))
 
@@ -473,22 +500,45 @@ class DeliveryApp(tk.Tk):
         self.stop_button = ttk.Button(buttons, text="停止", command=self.stop, state="disabled")
         self.stop_button.pack(side="left", padx=(8, 0))
 
-        # The browser is intentionally not automated.  These controls appear
-        # once the temporary channel is ready, so the operator can paste the
-        # bootstrap command into the Cloud Studio terminal.
+        # The browser/terminal is intentionally not automated.  Keep the
+        # command panel visible from launch so the operator always has one
+        # obvious place to copy the command; its text is filled as soon as the
+        # one-shot tunnel receives a usable endpoint.
         self.command_frame = ttk.LabelFrame(
-            outer, text="Cloud Studio 安装命令", padding=8
+            outer, text="Cloud Studio bash 命令", padding=8
         )
+        self.command_frame.pack(fill="x", pady=(6, 0))
         ttk.Label(
             self.command_frame,
-            text="临时通道建立后，点击复制安装命令，在 Cloud Studio 终端粘贴并回车；按提示输入同一密码和一次性 token。",
+            text="通道建立后命令会自动复制到剪贴板；也可以在这里再次复制，然后粘贴到 Cloud Studio 终端并回车。",
             foreground="#777777",
         ).pack(anchor="w")
+        command_text_frame = ttk.Frame(self.command_frame)
+        command_text_frame.pack(fill="x", pady=(6, 0))
+        self.command_text = tk.Text(
+            command_text_frame,
+            height=7,
+            wrap="word",
+            state="disabled",
+            font=("Consolas", 9),
+            relief="sunken",
+            borderwidth=1,
+        )
+        command_scrollbar = ttk.Scrollbar(
+            command_text_frame, orient="vertical", command=self.command_text.yview
+        )
+        self.command_text.configure(yscrollcommand=command_scrollbar.set)
+        self.command_text.configure(takefocus=1)
+        self.command_text.bind("<Control-c>", self.copy_command_event)
+        self.command_text.bind("<Control-a>", self.select_command_event)
+        self.command_text.pack(side="left", fill="x", expand=True)
+        command_scrollbar.pack(side="right", fill="y")
+        self.set_command_preview(self.command_placeholder)
         command_buttons = ttk.Frame(self.command_frame)
         command_buttons.pack(fill="x", pady=(6, 0))
         self.copy_button = ttk.Button(
             command_buttons,
-            text="复制安装命令",
+            text="复制 bash 命令",
             command=self.copy_command,
             state="disabled",
         )
@@ -506,7 +556,16 @@ class DeliveryApp(tk.Tk):
         self.status_label.pack(anchor="w")
         log_frame = ttk.LabelFrame(outer, text="运行日志", padding=6)
         log_frame.pack(fill="both", expand=True, pady=(6, 0))
-        self.log_text = tk.Text(log_frame, height=14, wrap="word", state="disabled", font=("Consolas", 9))
+        # Microsoft YaHei has complete CJK glyph coverage on normal Windows
+        # installations; Consolas alone can make otherwise-correct Chinese
+        # diagnostics look like boxes or broken text.
+        self.log_text = tk.Text(
+            log_frame,
+            height=14,
+            wrap="word",
+            state="disabled",
+            font=("Microsoft YaHei UI", 9),
+        )
         scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=scrollbar.set)
         self.log_text.pack(side="left", fill="both", expand=True)
@@ -514,19 +573,36 @@ class DeliveryApp(tk.Tk):
         self.password_entry.focus_set()
         self.password_entry.bind("<Return>", lambda _event: self.start())
 
+    def set_command_preview(self, command: str) -> None:
+        """Update the visible, read-only command area without touching the clipboard."""
+        if not hasattr(self, "command_text"):
+            return
+        self.command_text.configure(state="normal")
+        self.command_text.delete("1.0", "end")
+        self.command_text.insert("1.0", command)
+        self.command_text.configure(state="disabled")
+
+    def copy_command_event(self, _event=None):
+        """Allow Ctrl+C directly from the read-only command preview."""
+        self.copy_command()
+        return "break"
+
+    def select_command_event(self, _event=None):
+        """Allow Ctrl+A directly from the read-only command preview."""
+        self.command_text.tag_add("sel", "1.0", "end-1c")
+        return "break"
+
     def show_command_controls(self) -> None:
-        """Reveal the manual command controls once the tunnel is ready."""
+        """Enable command actions once the temporary tunnel is ready."""
         if not self.current_url:
             return
-        if not self.command_frame.winfo_manager():
-            self.command_frame.pack(fill="x", pady=(6, 0), before=self.status_label)
-        self.copy_button.configure(state="normal" if self.current_url else "disabled")
+        self.copy_button.configure(state="normal" if self.current_command else "disabled")
         self.copy_token_button.configure(state="normal" if self.current_token else "disabled")
 
     def hide_command_controls(self) -> None:
-        self.command_frame.pack_forget()
         self.copy_button.configure(state="disabled")
         self.copy_token_button.configure(state="disabled")
+        self.set_command_preview(self.command_placeholder)
 
     def toggle_advanced(self) -> None:
         if self.advanced_frame.winfo_manager():
@@ -595,6 +671,11 @@ class DeliveryApp(tk.Tk):
                     self.status_var.set(str(value))
                 elif event == "ready":
                     self.on_proxy_ready()
+                elif event == "command_preview":
+                    # The endpoint is known while the worker is coming up;
+                    # show the command early so it never has to be retyped.
+                    if self.prepared is not None:
+                        self.set_command_preview(str(value))
                 elif event == "done":
                     self.on_worker_done(int(value))
                 elif event == "error":
@@ -659,6 +740,7 @@ class DeliveryApp(tk.Tk):
         self.proxy_ready = False
         self.current_token = ""
         self.current_url = ""
+        self.current_command = ""
         self.status_var.set("正在准备加密载荷…")
         self.log("启动临时通道；密码只保存在本次进程内存和临时文件中。")
         options = RunOptions(
@@ -754,6 +836,11 @@ class DeliveryApp(tk.Tk):
             )
             self.prepared = assets
             self.current_token = receiver_token_value
+            preview_url = f"http://{url_host(server_addr)}:{temp_port}/v1/ssh-key"
+            self.post(
+                "command_preview",
+                make_remote_command(options.raw_base, preview_url, options.key_name),
+            )
             self.post("set", ("server", server_addr))
             self.post("set", ("server_port", str(server_port)))
             self.post("set", ("tls_name", tls_name))
@@ -799,14 +886,20 @@ class DeliveryApp(tk.Tk):
             self.post("status", "正在建立一次性 fpro 通道…")
             self.post("log", "启动本机接收器和临时 fpro 客户端…")
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            worker_env = os.environ.copy()
+            # The host may still be using CP936 (the default on many Windows
+            # installations).  The receiver emits UTF-8 over this pipe, so
+            # make that contract explicit and keep output unbuffered.
+            worker_env["PYTHONIOENCODING"] = "utf-8"
+            worker_env["PYTHONUTF8"] = "1"
+            worker_env["PYTHONUNBUFFERED"] = "1"
             self.worker = subprocess.Popen(
                 command,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                text=False,
+                env=worker_env,
                 creationflags=creationflags,
             )
             threading.Thread(target=self.read_worker, args=(self.worker,), daemon=True).start()
@@ -850,14 +943,17 @@ class DeliveryApp(tk.Tk):
         output.write_bytes(decrypt_file(encrypted, password, max_bytes=MAX_CONFIG_BYTES))
         return validate_windows_binary(output)
 
-    def read_worker(self, process: subprocess.Popen[str]) -> None:
+    def read_worker(self, process: subprocess.Popen[bytes]) -> None:
         try:
             if process.stdout is not None:
-                for line in process.stdout:
-                    line = line.rstrip()
+                for raw_line in process.stdout:
+                    line = decode_worker_line(raw_line)
+                    ready = WORKER_READY_MARKER in line or "临时 fpro 通道已建立" in line
+                    # Do not expose the protocol marker in the human log.
+                    line = line.replace(WORKER_READY_MARKER, "").strip()
                     if line:
                         self.post("log", line)
-                    if "临时 fpro 通道已建立" in line:
+                    if ready:
                         self.post("ready")
             code = process.wait()
         except OSError as exc:
@@ -872,28 +968,23 @@ class DeliveryApp(tk.Tk):
         assets = self.prepared
         self.current_url = f"http://{url_host(assets.server_addr)}:{assets.remote_port}/v1/ssh-key"
         command = make_remote_command(assets.raw_base, self.current_url, assets.key_name)
+        self.current_command = command
+        self.set_command_preview(command)
         self.clipboard_clear()
         self.clipboard_append(command)
         self.update()
         self.show_command_controls()
         self.status_var.set("临时通道已建立，请在 Cloud Studio 终端执行安装命令")
-        self.log("临时通道已建立；安装命令已复制到剪贴板。")
-        self.log("请把命令粘贴到 Cloud Studio 终端并回车，按提示输入同一密码和一次性 token。")
+        self.log("临时通道已建立；bash 命令已显示并复制到剪贴板。")
+        self.log("请把命令粘贴到 Cloud Studio 终端并回车，按提示输入密码和一次性 token。")
 
     def copy_command(self) -> None:
-        if not self.current_url:
+        if not self.current_command:
             return
-        raw_base = self.prepared.raw_base if self.prepared is not None else self.raw_var.get()
-        key_name = (
-            self.prepared.key_name
-            if self.prepared is not None
-            else (self.key_name_var.get().strip() or KEY_NAME_DEFAULT)
-        )
-        command = make_remote_command(raw_base, self.current_url, key_name)
         self.clipboard_clear()
-        self.clipboard_append(command)
+        self.clipboard_append(self.current_command)
         self.update()
-        self.log("Cloud Studio 指令已复制。")
+        self.log("bash 命令已复制。")
 
     def copy_token(self) -> None:
         if not self.current_token:
@@ -945,6 +1036,7 @@ class DeliveryApp(tk.Tk):
         self.prepared = None
         self.current_token = ""
         self.current_url = ""
+        self.current_command = ""
         if root is not None:
             shutil.rmtree(root, ignore_errors=True)
 
@@ -973,8 +1065,12 @@ def self_test() -> int:
     assert "FPRO_SSH_RECEIVER_TOKEN_FILE" in command
     assert "FPRO_PACKAGE_PASSWORD_FILE" in command
     assert "mktemp" in command and "trap 'rm -f" in command
+    assert "FPRO package password" in command
+    assert "FPRO one-time transfer token" in command
     assert "automate_cloudstudio" not in command
     assert "example.invalid" in command
+    assert decode_worker_line("临时 fpro 通道已建立".encode("gb18030")) == "临时 fpro 通道已建立"
+    assert decode_worker_line(WORKER_READY_MARKER.encode("ascii")) == WORKER_READY_MARKER
     named_command = make_remote_command(
         DEFAULT_RAW_BASE,
         "http://example.invalid:12345/v1/ssh-key",
