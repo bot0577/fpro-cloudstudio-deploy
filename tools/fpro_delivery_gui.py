@@ -60,6 +60,15 @@ KEY_NAME_DEFAULT = "fpro-cloudstudio"
 KEY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,96}$")
 DEFAULT_TEMP_PORT_MIN = 7001
 DEFAULT_TEMP_PORT_MAX = 7499
+# The container may need to download a platform binary, install sshd and
+# restart its watchdog before it can POST the encrypted key bundle.  Five
+# minutes was too short for a cold/slow Cloud Studio workspace.  Keep a
+# bounded safety timeout, but give the operator a full hour after the tunnel
+# becomes ready; successful delivery or the Stop button still closes it
+# immediately.
+DEFAULT_RECEIVER_TIMEOUT_MINUTES = 60
+MAX_RECEIVER_TIMEOUT_MINUTES = 24 * 60
+DEFAULT_PROXY_TIMEOUT_SECONDS = 120
 # Keep this in sync with ``fpro_ssh_receiver.READY_MARKER``.  It is ASCII by
 # design, so readiness detection works even if a legacy Windows code page is
 # involved in the child process stream.
@@ -401,6 +410,7 @@ class RunOptions:
     tls_server_name: str
     ssh_dir: str
     key_name: str
+    receiver_timeout_minutes: int
 
 
 def worker_command(args: list[str]) -> list[str]:
@@ -448,6 +458,13 @@ class DeliveryApp(tk.Tk):
         self.tls_name_var = tk.StringVar(value=str(values.get("tls_server_name", "")))
         self.ssh_dir_var = tk.StringVar(value=str(values.get("ssh_dir", pathlib.Path.home() / ".ssh")))
         self.key_name_var = tk.StringVar(value=str(values.get("key_name", KEY_NAME_DEFAULT)))
+        self.receiver_timeout_var = tk.StringVar(
+            value=str(
+                values.get(
+                    "receiver_timeout_minutes", DEFAULT_RECEIVER_TIMEOUT_MINUTES
+                )
+            )
+        )
 
     def build_ui(self) -> None:
         outer = ttk.Frame(self, padding=14)
@@ -492,6 +509,14 @@ class DeliveryApp(tk.Tk):
         self.add_row(advanced, 6, "SSH 私钥目录", "entry", self.ssh_dir_var)
         self.add_row(advanced, 7, "SSH 密钥名", "entry", self.key_name_var)
         self.add_row(advanced, 8, "Raw 基础地址", "entry", self.raw_var)
+        self.add_row(
+            advanced,
+            9,
+            "临时通道保持时间（分钟）",
+            "entry",
+            self.receiver_timeout_var,
+            hint=f"默认 {DEFAULT_RECEIVER_TIMEOUT_MINUTES}；成功交付后立即关闭",
+        )
 
         buttons = ttk.Frame(outer)
         buttons.pack(fill="x", pady=(12, 8))
@@ -719,6 +744,7 @@ class DeliveryApp(tk.Tk):
             "tls_server_name": self.tls_name_var.get().strip(),
             "ssh_dir": self.ssh_dir_var.get().strip(),
             "key_name": self.key_name_var.get().strip(),
+            "receiver_timeout_minutes": self.receiver_timeout_var.get().strip(),
         }
         try:
             target = settings_path()
@@ -727,7 +753,7 @@ class DeliveryApp(tk.Tk):
         except OSError:
             pass
 
-    def validate_inputs(self) -> tuple[str, Optional[int], str]:
+    def validate_inputs(self) -> tuple[str, Optional[int], str, int]:
         raw = normalize_raw_base(self.raw_var.get())
         port_text = self.temp_port_var.get().strip()
         port: Optional[int] = None
@@ -744,13 +770,25 @@ class DeliveryApp(tk.Tk):
         key_name = self.key_name_var.get().strip() or KEY_NAME_DEFAULT
         if not KEY_NAME_RE.fullmatch(key_name):
             raise AppError("SSH 密钥名只能包含字母、数字、点、下划线和连字符。")
-        return raw, port, password
+        timeout_text = self.receiver_timeout_var.get().strip()
+        if not timeout_text:
+            timeout_minutes = DEFAULT_RECEIVER_TIMEOUT_MINUTES
+        else:
+            try:
+                timeout_minutes = int(timeout_text)
+            except ValueError as exc:
+                raise AppError("临时通道保持时间必须是正整数分钟。") from exc
+        if not 1 <= timeout_minutes <= MAX_RECEIVER_TIMEOUT_MINUTES:
+            raise AppError(
+                f"临时通道保持时间必须在 1-{MAX_RECEIVER_TIMEOUT_MINUTES} 分钟范围内。"
+            )
+        return raw, port, password, timeout_minutes
 
     def start(self) -> None:
         if self.worker is not None:
             return
         try:
-            raw, temp_port, password = self.validate_inputs()
+            raw, temp_port, password, timeout_minutes = self.validate_inputs()
         except AppError as exc:
             messagebox.showerror(APP_NAME, str(exc))
             return
@@ -774,6 +812,7 @@ class DeliveryApp(tk.Tk):
             tls_server_name=self.tls_name_var.get().strip(),
             ssh_dir=self.ssh_dir_var.get().strip(),
             key_name=self.key_name_var.get().strip() or KEY_NAME_DEFAULT,
+            receiver_timeout_minutes=timeout_minutes,
         )
         self.worker_thread = threading.Thread(
             target=self.prepare_and_start,
@@ -900,6 +939,10 @@ class DeliveryApp(tk.Tk):
                 "--key-name",
                 options.key_name,
                 "--no-key-passphrase-prompt",
+                "--proxy-timeout",
+                str(DEFAULT_PROXY_TIMEOUT_SECONDS),
+                "--timeout",
+                str(options.receiver_timeout_minutes * 60),
                 "--response-grace",
                 "3",
             ]
@@ -909,7 +952,10 @@ class DeliveryApp(tk.Tk):
                 receiver_args.extend(["--ssh-host", server_addr, "--ssh-port", str(assets.ssh_port)])
             command = worker_command(receiver_args)
             self.post("status", "正在建立一次性 fpro 通道…")
-            self.post("log", "启动本机接收器和临时 fpro 客户端…")
+            self.post(
+                "log",
+                f"启动本机接收器和临时 fpro 客户端（通道就绪后保持 {options.receiver_timeout_minutes} 分钟）…",
+            )
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             worker_env = os.environ.copy()
             # The host may still be using CP936 (the default on many Windows

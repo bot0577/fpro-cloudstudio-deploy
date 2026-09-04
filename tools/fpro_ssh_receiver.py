@@ -58,6 +58,8 @@ except ImportError:  # pragma: no cover - package-relative import when embedded
 
 MAX_BUNDLE_BYTES = 4 * 1024 * 1024
 MAX_KEY_BYTES = 128 * 1024
+DEFAULT_RECEIVER_TIMEOUT_SECONDS = 60 * 60
+DEFAULT_PROXY_TIMEOUT_SECONDS = 120
 TOKEN_RE = re.compile(r"^[A-Za-z0-9._~-]{16,256}$")
 KEY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,96}$")
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -579,13 +581,17 @@ class OneShotHTTPServer(http.server.ThreadingHTTPServer):
         self._shutdown_timer: Optional[threading.Timer] = None
         self._shutdown_deadline = float("inf")
 
-    def schedule_shutdown(self, delay: float = 0.0) -> None:
+    def schedule_shutdown(self, delay: float = 0.0, *, timeout: bool = False) -> None:
         """Schedule one shutdown, replacing it only when a deadline is sooner.
 
         The timeout timer is normally long-lived, while a completed one-shot
         request should stop the listener shortly after its response is sent.
         Keeping this operation idempotent avoids competing ``shutdown()``
         calls from the request worker, timeout timer and cleanup path.
+
+        When ``timeout`` is true, the timer also marks the receiver state as
+        failed so the proxy worker cannot wait forever after the listener is
+        gone.
         """
         delay = max(0.0, float(delay))
         deadline = time.monotonic() + delay
@@ -595,10 +601,25 @@ class OneShotHTTPServer(http.server.ThreadingHTTPServer):
             if self._shutdown_timer is not None:
                 self._shutdown_timer.cancel()
             self._shutdown_deadline = deadline
-            timer = threading.Timer(delay, self.shutdown)
+            callback = self.expire if timeout else self.shutdown
+            timer = threading.Timer(delay, callback)
             timer.daemon = True
             self._shutdown_timer = timer
             timer.start()
+
+    def expire(self) -> None:
+        """Close an idle one-shot receiver and wake the proxy worker.
+
+        ``HTTPServer.shutdown()`` only stops ``serve_forever``; without also
+        setting ``state.done`` the proxy worker could keep waiting forever
+        after its listener had already disappeared.  Marking the state first
+        gives the GUI a deterministic timeout result and lets the fpro child
+        be terminated by the normal cleanup path.
+        """
+        if not self.state.done.is_set():
+            self.state.error = "一次性接收器等待超时，临时通道已关闭。"
+            self.state.done.set()
+        self.shutdown()
 
     def close(self) -> None:
         with self._shutdown_lock:
@@ -982,7 +1003,11 @@ def start_fpro_proxy(args: argparse.Namespace) -> int:
             [
                 f"serverAddr = {toml_quote(args.server_addr)}",
                 f"serverPort = {args.server_port}",
-                "loginFailExit = true",
+                # A transient network/auth handshake failure should not make
+                # the operator lose the one-shot channel while preparing the
+                # Cloud Studio terminal.  Keep reconnecting until the
+                # bounded receiver timeout or a successful upload.
+                "loginFailExit = false",
                 f"user = {toml_quote(user)}",
                 f"clientID = {toml_quote(client_id)}",
                 f"log.to = {toml_quote(str(log_file))}",
@@ -1016,7 +1041,6 @@ def start_fpro_proxy(args: argparse.Namespace) -> int:
     log_handle = log_file.open("ab")
     process: Optional[subprocess.Popen] = None
     try:
-        server.schedule_shutdown(args.timeout)
         process = subprocess.Popen(
             [str(binary), "-c", str(config)],
             stdout=log_handle,
@@ -1027,6 +1051,11 @@ def start_fpro_proxy(args: argparse.Namespace) -> int:
         ):
             detail = read_text_tail(log_file)
             fail(f"临时 fpro 端口未上线。客户端日志：{detail}")
+        # Start the operator-facing timeout only after the authenticated
+        # receiver path is genuinely online.  Slow binary downloads, sshd
+        # installation and the initial health check must not consume the
+        # time reserved for pasting and running install.sh.
+        server.schedule_shutdown(args.timeout, timeout=True)
         remote_url_host = url_host(args.server_addr)
         # Emit an ASCII-only event before the localized status line.  The
         # packaged GUI uses this marker so readiness detection remains correct
@@ -1135,7 +1164,12 @@ def build_parser() -> argparse.ArgumentParser:
     listen.add_argument("--port", type=int, default=0)
     listen.add_argument("--endpoint", default="/v1/ssh-key")
     listen.add_argument("--allow-public", action="store_true")
-    listen.add_argument("--timeout", type=float, default=300)
+    listen.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_RECEIVER_TIMEOUT_SECONDS,
+        help="无请求时的最长等待秒数（默认 3600；成功接收后立即关闭）",
+    )
     listen.add_argument("--remote-port", type=int, default=0, help="仅用于提示输出")
     add_secret_options(listen, token=True)
     add_secret_options(listen, token=False)
@@ -1157,14 +1191,24 @@ def build_parser() -> argparse.ArgumentParser:
     proxy.add_argument("--port", type=int, default=0)
     proxy.add_argument("--endpoint", default="/v1/ssh-key")
     proxy.add_argument("--allow-public", action="store_true")
-    proxy.add_argument("--proxy-timeout", type=float, default=45)
+    proxy.add_argument(
+        "--proxy-timeout",
+        type=float,
+        default=DEFAULT_PROXY_TIMEOUT_SECONDS,
+        help="等待 fpro 远端端口上线的秒数（默认 120）",
+    )
     proxy.add_argument(
         "--response-grace",
         type=float,
         default=3.0,
         help="HTTP 响应写入后保留临时 fpro 通道的秒数（默认 3）",
     )
-    proxy.add_argument("--timeout", type=float, default=300)
+    proxy.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_RECEIVER_TIMEOUT_SECONDS,
+        help="通道就绪后的最长等待秒数（默认 3600；成功接收后立即关闭）",
+    )
     add_secret_options(proxy, token=True)
     add_secret_options(proxy, kind="fpro_token")
     add_secret_options(proxy, token=False)
