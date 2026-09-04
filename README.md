@@ -20,6 +20,15 @@ EXE 内置解密和密钥校验逻辑，不要求另外安装 Python 或 OpenSSL
 Cloud Studio 登录仍须由操作者提供。构建命令及高级/手动流程见
 [使用说明.md](使用说明.md)。
 
+## 功能边界（核对）
+
+本方案的临时 fpro 通道用于一次性传输**加密的 SSH 私钥包**，不是通用文件
+同步服务。GUI 会让目标容器生成 Ed25519 密钥，把公钥写入
+`/root/.ssh/authorized_keys`（关闭 SSH 密码登录），再将私钥和公钥打成加密
+包，经临时通道发送回本机；本机接收器校验、解密并写入
+`%USERPROFILE%\.ssh\fpro-cloudstudio`。配置包和按架构选择的 fpro 二进制则通过
+HTTPS 下载，mTLS 证书、客户端私钥和 auth token 只作为临时 fpro 通道的内部材料。
+
 ## 文件布局
 
 仓库根目录中的二进制文件保持平台原名，仅在末尾增加 `.enc`：

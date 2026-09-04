@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """One-shot SSH key delivery receiver for FPRO deployments.
 
-The normal bootstrap path is to generate the SSH key on the operator's
-workstation and send only its public key to the container.  This utility is a
-fallback for environments where the key must be generated in the container.
+The GUI bootstrap path generates the SSH key in the target container, then
+sends one encrypted private/public-key bundle back to this workstation.  This
+utility is deliberately scoped to that one-shot key bundle; it is not a
+general-purpose file synchronizer.
 
 It supports three operations:
 
