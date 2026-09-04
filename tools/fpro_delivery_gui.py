@@ -521,6 +521,9 @@ class DeliveryApp(tk.Tk):
             wrap="word",
             state="disabled",
             font=("Consolas", 9),
+            foreground="#202020",
+            disabledforeground="#202020",
+            background="#ffffff",
             relief="sunken",
             borderwidth=1,
         )
@@ -565,6 +568,9 @@ class DeliveryApp(tk.Tk):
             wrap="word",
             state="disabled",
             font=("Microsoft YaHei UI", 9),
+            foreground="#202020",
+            disabledforeground="#202020",
+            background="#ffffff",
         )
         scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=scrollbar.set)
