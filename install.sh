@@ -904,16 +904,16 @@ if [ -n "$SSH_RECEIVER_URL" ]; then
     unset SSH_RECEIVER_TOKEN
 fi
 
-# 如调用方提供对应的 SSH 私钥，可在端口探测通过后追加完整登录验证。
-# FPRO_SSH_GENERATE=1 时使用本次生成的临时私钥自动完成验证；私钥不会
-# 打印到终端，且脚本退出时会清理临时明文，只留下加密导出文件（若启用）。
+# 默认成功标准就是上面的 TCP 端口存活。只有调用方明确提供
+# FPRO_TUNNEL_SSH_KEY，或设置 FPRO_TUNNEL_REQUIRE_SSH=1，才追加完整 SSH
+# 登录验证；不能因为脚本恰好生成了临时私钥，就把端口存活升级为强制登录
+# 自检（否则映射刚上线时的认证时序会造成误报失败）。
 SELFTEST_KEY="${FPRO_TUNNEL_SSH_KEY:-}"
-if [ -z "$SELFTEST_KEY" ] && [ "$SSH_KEY_GENERATED" = "1" ] && [ -z "$SSH_GENERATED_KEY_PASSPHRASE" ]; then
-    SELFTEST_KEY="$SSH_PRIVATE_KEY_PATH"
-fi
-if [ -n "${FPRO_TUNNEL_SSH_KEY:-}" ] || \
-        { [ "$SSH_KEY_GENERATED" = "1" ] && [ -z "$SSH_GENERATED_KEY_PASSPHRASE" ]; } || \
-        [ -n "$SSH_EXPLICIT_PRIVATE" ] || [ "${FPRO_TUNNEL_REQUIRE_SSH:-0}" = "1" ]; then
+if [ "${FPRO_TUNNEL_REQUIRE_SSH:-0}" = "1" ] || [ -n "$SELFTEST_KEY" ]; then
+    if [ -z "$SELFTEST_KEY" ] && [ "$SSH_KEY_GENERATED" = "1" ] \
+            && [ -z "$SSH_GENERATED_KEY_PASSPHRASE" ]; then
+        SELFTEST_KEY="$SSH_PRIVATE_KEY_PATH"
+    fi
     [ -n "$SELFTEST_KEY" ] || die "严格 SSH 自检需要设置 FPRO_TUNNEL_SSH_KEY，或启用 FPRO_SSH_GENERATE=1。"
     [ -f "$SELFTEST_KEY" ] || die "SSH 自检私钥不存在：$SELFTEST_KEY"
     if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=6 -o BatchMode=yes \
