@@ -609,7 +609,9 @@ class DeliveryApp(tk.Tk):
             self.advanced_frame.pack_forget()
             self.advanced_toggle.configure(text="显示高级设置（通常不用改）")
         else:
-            self.advanced_frame.pack(fill="x", pady=(6, 0))
+            # Keep advanced fields with the input controls instead of letting
+            # Tk pack them after the growing log widget.
+            self.advanced_frame.pack(fill="x", pady=(6, 0), before=self.command_frame)
             self.advanced_toggle.configure(text="隐藏高级设置")
 
     def add_row(self, parent, row: int, label: str, kind: str, variable, extra=None, hint: str = "") -> None:
