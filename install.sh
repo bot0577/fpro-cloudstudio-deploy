@@ -16,9 +16,9 @@
 #    curl -fsSL https://raw.githubusercontent.com/bot0577/fpro-cloudstudio-deploy/main/install.sh | sudo bash
 #    # 没有本地 SSH 密钥时，生成一对并导出加密私钥包：
 #    sudo env FPRO_SSH_GENERATE=1 bash install.sh
-#    # 使用本机 fpro_ssh_receiver.py 建立的一次性接收端点自动交付：
-#    sudo env FPRO_SSH_GENERATE=1 FPRO_SSH_RECEIVER_URL=... \
-#      FPRO_SSH_RECEIVER_TOKEN_FILE=/path/to/token bash install.sh
+#    # 使用本机 fpro_ssh_receiver.py 建立的密码 challenge-response 接收端点：
+#    sudo env FPRO_SSH_GENERATE=1 FPRO_SSH_RECEIVER_URL=... bash install.sh
+#    # 旧版调用方仍可显式设置 FPRO_SSH_RECEIVER_TOKEN(_FILE) 使用 token 模式。
 #    # 自动化调用方也可把密码放入临时 600 文件，完成后立即删除：
 #    sudo env FPRO_PACKAGE_PASSWORD_FILE=/path/to/password bash install.sh
 #    或通过 PKG_URL / BINARY_BASE_URL 覆盖默认下载地址
@@ -39,9 +39,11 @@ RAW_BASE_URL="${FPRO_REPO_RAW_BASE_URL:-https://raw.githubusercontent.com/bot057
 RAW_BASE_URL="${RAW_BASE_URL%/}"
 SSH_KEY_NAME="${FPRO_SSH_KEY_NAME:-fpro-cloudstudio}"
 SSH_RECEIVER_URL="${FPRO_SSH_RECEIVER_URL:-}"
+SSH_RECEIVER_AUTH="${FPRO_SSH_RECEIVER_AUTH:-}"
 SSH_RECEIVER_TOKEN="${FPRO_SSH_RECEIVER_TOKEN:-}"
 SSH_RECEIVER_TOKEN_FILE="${FPRO_SSH_RECEIVER_TOKEN_FILE:-}"
 SSH_RECEIVER_TIMEOUT="${FPRO_SSH_RECEIVER_TIMEOUT:-60}"
+SSH_RECEIVER_PASSWORD_FILE=""
 PACKAGE_PASSWORD_FILE="${FPRO_PACKAGE_PASSWORD_FILE:-}"
 SCRIPT_REF="${BASH_SOURCE[0]:-}"
 if [ -n "$SCRIPT_REF" ] && [ -f "$SCRIPT_REF" ]; then
@@ -68,22 +70,48 @@ die() {
 if [ -n "$SSH_RECEIVER_URL" ]; then
     [[ "$SSH_RECEIVER_URL" =~ ^https?://[^[:space:]]+$ ]] \
         || die "FPRO_SSH_RECEIVER_URL 必须是 http(s) URL。"
-    if [ -n "$SSH_RECEIVER_TOKEN_FILE" ]; then
-        [ -z "$SSH_RECEIVER_TOKEN" ] \
-            || die "请只设置 FPRO_SSH_RECEIVER_TOKEN 或 FPRO_SSH_RECEIVER_TOKEN_FILE 其中一个。"
-        [ -f "$SSH_RECEIVER_TOKEN_FILE" ] \
-            || die "FPRO_SSH_RECEIVER_TOKEN_FILE 不存在：$SSH_RECEIVER_TOKEN_FILE"
-        # Read exactly the first line; the token itself never enters the
-        # command line or shell history.  A missing final newline is valid.
-        IFS= read -r SSH_RECEIVER_TOKEN < "$SSH_RECEIVER_TOKEN_FILE" || true
-        SSH_RECEIVER_TOKEN="${SSH_RECEIVER_TOKEN%$'\r'}"
+    case "${SSH_RECEIVER_AUTH,,}" in
+        "")
+            # The one-click GUI leaves token variables unset.  Select the
+            # password challenge-response automatically; explicit legacy
+            # token input continues to select token mode for compatibility.
+            if [ -n "$SSH_RECEIVER_TOKEN" ] || [ -n "$SSH_RECEIVER_TOKEN_FILE" ]; then
+                SSH_RECEIVER_AUTH="token"
+            else
+                SSH_RECEIVER_AUTH="password"
+            fi
+            ;;
+        password|challenge|challenge-response)
+            SSH_RECEIVER_AUTH="password"
+            ;;
+        token)
+            SSH_RECEIVER_AUTH="token"
+            ;;
+        *)
+            die "FPRO_SSH_RECEIVER_AUTH 只能是 password 或 token。"
+            ;;
+    esac
+    if [ "$SSH_RECEIVER_AUTH" = "token" ]; then
+        if [ -n "$SSH_RECEIVER_TOKEN_FILE" ]; then
+            [ -z "$SSH_RECEIVER_TOKEN" ] \
+                || die "请只设置 FPRO_SSH_RECEIVER_TOKEN 或 FPRO_SSH_RECEIVER_TOKEN_FILE 其中一个。"
+            [ -f "$SSH_RECEIVER_TOKEN_FILE" ] \
+                || die "FPRO_SSH_RECEIVER_TOKEN_FILE 不存在：$SSH_RECEIVER_TOKEN_FILE"
+            # Read exactly the first line; the token itself never enters the
+            # command line or shell history.  A missing final newline is valid.
+            IFS= read -r SSH_RECEIVER_TOKEN < "$SSH_RECEIVER_TOKEN_FILE" || true
+            SSH_RECEIVER_TOKEN="${SSH_RECEIVER_TOKEN%$'\r'}"
+        fi
+        [[ "$SSH_RECEIVER_TOKEN" =~ ^[A-Za-z0-9._~-]{16,256}$ ]] \
+            || die "FPRO_SSH_RECEIVER_TOKEN 必须是 16-256 位随机 token。"
+    else
+        [ -z "$SSH_RECEIVER_TOKEN" ] && [ -z "$SSH_RECEIVER_TOKEN_FILE" ] \
+            || die "password 接收模式不需要 FPRO_SSH_RECEIVER_TOKEN(_FILE)。"
     fi
-    [[ "$SSH_RECEIVER_TOKEN" =~ ^[A-Za-z0-9._~-]{16,256}$ ]] \
-        || die "FPRO_SSH_RECEIVER_TOKEN 必须是 16-256 位随机 token。"
     [[ "$SSH_RECEIVER_TIMEOUT" =~ ^[1-9][0-9]*$ ]] \
         || die "FPRO_SSH_RECEIVER_TIMEOUT 必须是正整数秒数。"
-elif [ -n "$SSH_RECEIVER_TOKEN" ] || [ -n "$SSH_RECEIVER_TOKEN_FILE" ]; then
-    die "设置 FPRO_SSH_RECEIVER_TOKEN(_FILE) 前必须先设置 FPRO_SSH_RECEIVER_URL。"
+elif [ -n "$SSH_RECEIVER_TOKEN" ] || [ -n "$SSH_RECEIVER_TOKEN_FILE" ] || [ -n "$SSH_RECEIVER_AUTH" ]; then
+    die "设置 FPRO_SSH_RECEIVER_AUTH 或 FPRO_SSH_RECEIVER_TOKEN(_FILE) 前必须先设置 FPRO_SSH_RECEIVER_URL。"
 fi
 
 download_artifact() {
@@ -295,6 +323,15 @@ echo
 if [ -z "$PASS" ]; then
     echo "[-] 密码为空，已取消。" >&2
     exit 1
+fi
+
+# Password-auth delivery reuses the package password after the main shell
+# variable is cleared.  Keep one short-lived 600-permission copy inside the
+# already-private temporary directory; it is removed by the normal EXIT trap.
+if [ -n "$SSH_RECEIVER_URL" ] && [ "$SSH_RECEIVER_AUTH" = "password" ]; then
+    SSH_RECEIVER_PASSWORD_FILE="$TMP/receiver-password"
+    printf '%s' "$PASS" > "$SSH_RECEIVER_PASSWORD_FILE"
+    chmod 600 "$SSH_RECEIVER_PASSWORD_FILE"
 fi
 
 # ---- 2. 解密（密码错则立即失败，不落地） -----------------------------------
@@ -597,7 +634,14 @@ export_ssh_key_bundle() {
     [ "$requested" = "1" ] || return 0
     [ -n "$SSH_PRIVATE_KEY_PATH" ] || die "请求导出 SSH 私钥，但当前没有可导出的私钥。"
 
-    export_pass="${FPRO_SSH_EXPORT_PASSWORD:-$PASS}"
+    if [ -n "$SSH_RECEIVER_URL" ] && [ "$SSH_RECEIVER_AUTH" = "password" ]; then
+        # The one-click workflow intentionally has one password.  A separate
+        # export password would make the receiver unable to prove the upload
+        # without introducing a second prompt, so use the package password.
+        export_pass="$PASS"
+    else
+        export_pass="${FPRO_SSH_EXPORT_PASSWORD:-$PASS}"
+    fi
     [ -n "$export_pass" ] || die "SSH 私钥导出密码为空。"
     safe_fp="${SSH_KEY_FINGERPRINT//:/_}"
     safe_fp="${safe_fp//\//_}"
@@ -650,13 +694,112 @@ sha256_path() {
 send_ssh_key_bundle() {
     [ -n "$SSH_RECEIVER_URL" ] || return 0
     [ -s "$SSH_KEY_EXPORT_PATH" ] || die "SSH 私钥加密包不存在，无法交付。"
-    local digest="$1" response
+    local digest="$1" receiver_password_file rc
     echo "[*] 将加密 SSH 私钥包发送到一次性本机接收器 ..."
 
-    # Python avoids putting the transfer token in the process command line.
-    # The token is read from the inherited environment and is never printed.
+    if [ "$SSH_RECEIVER_AUTH" = "password" ]; then
+        # Password-auth mode derives a proof from the same package password
+        # that was already entered above.  Keep it in a 600-permission file so
+        # it never appears in a process argument or exported environment.
+        command -v python3 >/dev/null 2>&1 \
+            || { echo "[-] password 接收模式需要容器提供 python3。" >&2; return 1; }
+        receiver_password_file="$SSH_RECEIVER_PASSWORD_FILE"
+        [ -s "$receiver_password_file" ] \
+            || { echo "[-] 接收认证密码临时文件不存在。" >&2; return 1; }
+        if FPRO_SSH_RECEIVER_URL="$SSH_RECEIVER_URL" \
+            FPRO_SSH_RECEIVER_TIMEOUT="$SSH_RECEIVER_TIMEOUT" \
+            python3 - "$SSH_KEY_EXPORT_PATH" "$digest" "$SSH_KEY_FINGERPRINT" "$receiver_password_file" <<'PY'
+import hashlib
+import hmac
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+
+path, digest, fingerprint, password_path = sys.argv[1:5]
+url = os.environ["FPRO_SSH_RECEIVER_URL"]
+timeout = float(os.environ.get("FPRO_SSH_RECEIVER_TIMEOUT", "60"))
+challenge_re = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
+proof_prefix = "fpro-ssh-delivery-v1"
+with open(password_path, "r", encoding="utf-8") as stream:
+    password = stream.read().rstrip("\r\n")
+if not password:
+    raise SystemExit("receiver password is empty")
+
+challenge_request = urllib.request.Request(
+    url,
+    method="GET",
+    headers={"Accept": "application/json", "Connection": "close"},
+)
+try:
+    with urllib.request.urlopen(challenge_request, timeout=timeout) as response:
+        if response.status < 200 or response.status >= 300:
+            raise RuntimeError(f"HTTP {response.status}")
+        result = json.loads(response.read(8192).decode("utf-8", "replace"))
+except urllib.error.HTTPError as exc:
+    raise SystemExit(f"receiver challenge HTTP {exc.code}")
+except Exception as exc:
+    raise SystemExit(f"receiver challenge request failed: {exc}")
+
+challenge = str(result.get("challenge", ""))
+if result.get("ok") is not True or not challenge_re.fullmatch(challenge):
+    raise SystemExit("receiver returned an invalid challenge")
+message = f"{proof_prefix}\n{challenge}\n{digest.lower()}\n{fingerprint}".encode("utf-8")
+proof = hmac.new(password.encode("utf-8"), message, hashlib.sha256).hexdigest()
+with open(path, "rb") as stream:
+    body = stream.read()
+request = urllib.request.Request(
+    url,
+    data=body,
+    method="POST",
+    headers={
+        "Content-Type": "application/octet-stream",
+        "Content-Length": str(len(body)),
+        "X-FPRO-Password-Proof": proof,
+        "X-FPRO-SHA256": digest,
+        "X-FPRO-Key-Fingerprint": fingerprint,
+        "Connection": "close",
+    },
+)
+try:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        result = response.read(4096).decode("utf-8", "replace")
+        if response.status < 200 or response.status >= 300:
+            raise RuntimeError(f"HTTP {response.status}")
+        try:
+            parsed = json.loads(result)
+        except Exception:
+            parsed = {}
+        if parsed.get("ok") is not True:
+            raise RuntimeError("receiver rejected bundle")
+except urllib.error.HTTPError as exc:
+    raise SystemExit(f"receiver HTTP {exc.code}")
+except Exception as exc:
+    raise SystemExit(f"receiver request failed: {exc}")
+PY
+        then
+            rm -f -- "$receiver_password_file"
+            SSH_KEY_DELIVERED=1
+            if [ "${FPRO_SSH_KEEP_EXPORT:-0}" != "1" ]; then
+                rm -f -- "$SSH_KEY_EXPORT_PATH"
+                SSH_KEY_EXPORT_PATH=""
+            fi
+            echo "[+] 加密 SSH 私钥包已通过密码 challenge-response 接收并解密。"
+            return 0
+        else
+            rc=$?
+            rm -f -- "$receiver_password_file"
+            return "$rc"
+        fi
+    fi
+
+    # Legacy token mode is retained for older CLI callers.  It is never used
+    # by the GUI and therefore does not require the operator to copy a token in
+    # the normal one-click workflow.
     if command -v python3 >/dev/null 2>&1; then
-        if ! FPRO_SSH_RECEIVER_URL="$SSH_RECEIVER_URL" \
+        if FPRO_SSH_RECEIVER_URL="$SSH_RECEIVER_URL" \
             FPRO_SSH_RECEIVER_TOKEN="$SSH_RECEIVER_TOKEN" \
             FPRO_SSH_RECEIVER_TIMEOUT="$SSH_RECEIVER_TIMEOUT" \
             python3 - "$SSH_KEY_EXPORT_PATH" "$digest" "$SSH_KEY_FINGERPRINT" <<'PY'
@@ -709,10 +852,10 @@ PY
             fi
             echo "[+] 加密 SSH 私钥包已由本机接收器接收并解密。"
             return 0
+        else
+            return $?
         fi
     elif command -v curl >/dev/null 2>&1; then
-        # Minimal fallback for images without Python.  The token is still only
-        # used for this short-lived process and the payload remains encrypted.
         if curl --fail --silent --show-error --max-time "$SSH_RECEIVER_TIMEOUT" \
             --proto '=http,https' \
             -H "Content-Type: application/octet-stream" \
@@ -899,9 +1042,12 @@ if [ -n "$SSH_RECEIVER_URL" ]; then
         preserve_failed_ssh_export
         die "SSH 私钥自动交付失败；未继续报告部署完成。"
     fi
-    # The token is no longer needed after the one-shot POST.  Remove it from
-    # the shell environment before the remaining diagnostics run.
+    # Delivery credentials are no longer needed after the one-shot POST.
     unset SSH_RECEIVER_TOKEN
+    if [ -n "$SSH_RECEIVER_PASSWORD_FILE" ]; then
+        rm -f -- "$SSH_RECEIVER_PASSWORD_FILE"
+        SSH_RECEIVER_PASSWORD_FILE=""
+    fi
 fi
 
 # 默认成功标准就是上面的 TCP 端口存活。只有调用方明确提供

@@ -15,10 +15,13 @@ It supports three operations:
 
 The receiver never sends the package password.  The password is entered on
 this workstation, after the encrypted bytes have been received.  The HTTP
-endpoint is one-shot, checks a random application token and SHA-256, validates
-the private/public key pair, and writes the result atomically under ~/.ssh.
-The temporary fpro proxy uses a separate ``--fpro-token-file`` credential for
-the fpro server; it must never be confused with the one-shot HTTP token.
+endpoint is one-shot, checks SHA-256 and a password-derived challenge proof,
+validates the private/public key pair, and writes the result atomically under
+~/.ssh.  A legacy random HTTP token mode remains available for older callers,
+but the packaged GUI uses password-auth mode so the operator only enters one
+password.  The temporary fpro proxy uses a separate ``--fpro-token-file``
+credential for the fpro server; it must never be confused with the delivery
+authentication.
 The packaged Windows app includes its crypto/key parser.  The standalone CLI
 prefers the optional ``cryptography`` package and falls back to local
 ``openssl``/``ssh-keygen`` for legacy environments.
@@ -60,10 +63,14 @@ MAX_BUNDLE_BYTES = 4 * 1024 * 1024
 MAX_KEY_BYTES = 128 * 1024
 DEFAULT_RECEIVER_TIMEOUT_SECONDS = 60 * 60
 DEFAULT_PROXY_TIMEOUT_SECONDS = 120
+DEFAULT_CHALLENGE_TTL_SECONDS = 5 * 60
 TOKEN_RE = re.compile(r"^[A-Za-z0-9._~-]{16,256}$")
+CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
 KEY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,96}$")
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 FINGERPRINT_RE = re.compile(r"^SHA256:[A-Za-z0-9+/=_-]+$")
+PROOF_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+AUTH_MESSAGE_PREFIX = "fpro-ssh-delivery-v1"
 # An ASCII-only event line lets the Windows GUI detect readiness without
 # depending on the active system code page.  The human-readable Chinese line
 # is still emitted for standalone CLI users.
@@ -145,6 +152,28 @@ def validate_fpro_token(token: str) -> str:
     if not token or len(token) > 4096 or "\r" in token or "\n" in token:
         fail("fpro 认证 token 为空、过长或包含换行。")
     return token
+
+
+def auth_message(challenge: str, digest: str, fingerprint: str) -> bytes:
+    """Build the canonical challenge-response message.
+
+    Keep the framing identical in the container-side ``install.sh`` client and
+    this receiver.  Including both the encrypted-payload digest and the SSH
+    fingerprint prevents a proof captured for one upload from authorizing a
+    different bundle.
+    """
+    return (
+        f"{AUTH_MESSAGE_PREFIX}\n{challenge}\n{digest.lower()}\n{fingerprint}"
+    ).encode("utf-8")
+
+
+def password_proof(password: str, challenge: str, digest: str, fingerprint: str) -> str:
+    """Return the hex HMAC used by password-auth delivery mode."""
+    return hmac.new(
+        password.encode("utf-8"),
+        auth_message(challenge, digest, fingerprint),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def validate_key_name(name: str) -> str:
@@ -511,8 +540,19 @@ def print_connection(args: argparse.Namespace, private_path: pathlib.Path, finge
         )
 
 
-def complete_install(args: argparse.Namespace, encrypted_path: pathlib.Path, expected_fp: Optional[str] = None) -> str:
-    password = package_password(args)
+def complete_install(
+    args: argparse.Namespace,
+    encrypted_path: pathlib.Path,
+    expected_fp: Optional[str] = None,
+    *,
+    password_override: Optional[str] = None,
+) -> str:
+    # Proxy password-auth mode reads the package password once before the
+    # listener starts.  Reuse that value for the POST instead of prompting a
+    # second time (and avoid keeping a terminal prompt blocked in a worker
+    # thread).  Standalone decrypt/fetch/listen calls retain their normal
+    # interactive behavior when no override is supplied.
+    password = password_override if password_override is not None else package_password(args)
     fp_header = expected_fp or getattr(args, "expected_fingerprint", None)
     if fp_header and not FINGERPRINT_RE.fullmatch(fp_header):
         fail("预期 SSH 指纹格式无效。")
@@ -569,9 +609,20 @@ class OneShotHTTPServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False
 
-    def __init__(self, address, handler, *, token: str, args: argparse.Namespace, state: ReceiverState):
+    def __init__(
+        self,
+        address,
+        handler,
+        *,
+        token: str,
+        password: Optional[str] = None,
+        args: argparse.Namespace,
+        state: ReceiverState,
+    ):
         super().__init__(address, handler)
         self.token = token
+        self.password = password or ""
+        self.password_auth = bool(getattr(args, "password_auth", False))
         self.args = args
         self.state = state
         self.endpoint = args.endpoint
@@ -580,6 +631,43 @@ class OneShotHTTPServer(http.server.ThreadingHTTPServer):
         self._shutdown_lock = threading.Lock()
         self._shutdown_timer: Optional[threading.Timer] = None
         self._shutdown_deadline = float("inf")
+        self._challenge_lock = threading.Lock()
+        self._challenge = ""
+        self._challenge_deadline = 0.0
+
+    def issue_challenge(self) -> str:
+        """Return a short-lived challenge for password-auth uploads.
+
+        Keep the current challenge stable until it is consumed.  A public
+        mapped port can be probed by third parties; replacing the challenge on
+        every GET would let an unauthenticated probe invalidate the operator's
+        in-flight upload and turn the endpoint into an easy denial-of-service.
+        """
+        with self._challenge_lock:
+            now = time.monotonic()
+            if self._challenge and now <= self._challenge_deadline:
+                return self._challenge
+            challenge = secrets.token_urlsafe(32)
+            self._challenge = challenge
+            self._challenge_deadline = now + DEFAULT_CHALLENGE_TTL_SECONDS
+        return challenge
+
+    def consume_password_proof(self, proof: str, digest: str, fingerprint: str) -> bool:
+        """Validate and consume the current password proof atomically."""
+        if not PROOF_RE.fullmatch(proof):
+            return False
+        with self._challenge_lock:
+            challenge = self._challenge
+            if not challenge or time.monotonic() > self._challenge_deadline:
+                return False
+            expected = password_proof(self.password, challenge, digest, fingerprint)
+            if not hmac.compare_digest(proof.lower(), expected):
+                return False
+            # A proof is single-use even if a second request races the first
+            # before ``ReceiverState.claim`` runs.
+            self._challenge = ""
+            self._challenge_deadline = 0.0
+            return True
 
     def schedule_shutdown(self, delay: float = 0.0, *, timeout: bool = False) -> None:
         """Schedule one shutdown, replacing it only when a deadline is sooner.
@@ -629,6 +717,11 @@ class OneShotHTTPServer(http.server.ThreadingHTTPServer):
         try:
             super().server_close()
         finally:
+            # Drop secret material as soon as the one-shot listener closes.
+            self.password = ""
+            with self._challenge_lock:
+                self._challenge = ""
+                self._challenge_deadline = 0.0
             shutil.rmtree(self.work_dir, ignore_errors=True)
 
 
@@ -651,6 +744,7 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
@@ -669,24 +763,80 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             self.server_obj.schedule_shutdown(0.2)
 
     def do_GET(self) -> None:
-        if self.path != "/healthz":
-            self.reject(404, "not found")
+        server = self.server_obj
+        if self.path == "/healthz":
+            # Password-auth mode deliberately has no separately copied token.
+            # Health only reports readiness and contains no secret or bundle
+            # data, so the fpro proxy can verify the complete HTTP path without
+            # another operator action.  Legacy token mode keeps its original
+            # authenticated health check.
+            if not server.password_auth:
+                supplied = self.headers.get("X-FPRO-Transfer-Token", "")
+                if not hmac.compare_digest(supplied, server.token):
+                    self.reject(401, "unauthorized")
+                    return
+            self.send_json(
+                {
+                    "ok": True,
+                    "ready": server.state.available(),
+                    "auth": "password" if server.password_auth else "token",
+                },
+                200,
+            )
             return
-        supplied = self.headers.get("X-FPRO-Transfer-Token", "")
-        if not hmac.compare_digest(supplied, self.server_obj.token):
-            self.reject(401, "unauthorized")
+
+        # In password-auth mode the first GET on the upload endpoint obtains a
+        # short-lived challenge; repeated GETs return the same challenge until
+        # it is consumed or expires.  The subsequent POST must prove knowledge
+        # of the package password without putting that password in a URL,
+        # header, command line, or shell history.
+        if self.path == server.endpoint and server.password_auth:
+            if not server.state.available():
+                self.reject(409, "one-shot receiver already used")
+                return
+            challenge = server.issue_challenge()
+            self.send_json(
+                {
+                    "ok": True,
+                    "challenge": challenge,
+                    "expires_in": DEFAULT_CHALLENGE_TTL_SECONDS,
+                },
+                200,
+            )
             return
-        self.send_json({"ok": True, "ready": self.server_obj.state.available()}, 200)
+
+        self.reject(404, "not found")
 
     def do_POST(self) -> None:
         server = self.server_obj
         if self.path != server.endpoint:
             self.reject(404, "not found")
             return
-        supplied = self.headers.get("X-FPRO-Transfer-Token", "")
-        if not hmac.compare_digest(supplied, server.token):
-            self.reject(401, "unauthorized")
+
+        # Validate the headers needed for both authentication and integrity
+        # before reserving the one-shot request.  An unauthenticated malformed
+        # request must not be able to consume the receiver and deny the real
+        # upload.
+        supplied_digest = self.headers.get("X-FPRO-SHA256", "").strip()
+        expected_fp = self.headers.get("X-FPRO-Key-Fingerprint", "").strip()
+        if not SHA256_RE.fullmatch(supplied_digest):
+            self.reject(400, "invalid sha256")
             return
+        if not FINGERPRINT_RE.fullmatch(expected_fp):
+            self.reject(400, "invalid fingerprint")
+            return
+
+        if server.password_auth:
+            proof = self.headers.get("X-FPRO-Password-Proof", "").strip()
+            if not server.consume_password_proof(proof, supplied_digest, expected_fp):
+                self.reject(401, "unauthorized")
+                return
+        else:
+            supplied = self.headers.get("X-FPRO-Transfer-Token", "")
+            if not hmac.compare_digest(supplied, server.token):
+                self.reject(401, "unauthorized")
+                return
+
         if server.state.done.is_set() or not server.state.claim():
             self.reject(409, "one-shot receiver already used")
             return
@@ -706,10 +856,6 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             self.reject(400, "incomplete request", finish=True)
             return
 
-        # The sender must provide the digest.  Accepting an omitted header
-        # would turn the encrypted upload into a token-only transfer and
-        # would no longer satisfy the one-shot delivery contract.
-        supplied_digest = self.headers.get("X-FPRO-SHA256", "").strip()
         digest = hashlib.sha256(payload).hexdigest()
         if (
             not SHA256_RE.fullmatch(supplied_digest)
@@ -717,18 +863,16 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
         ):
             self.reject(400, "sha256 mismatch", finish=True)
             return
-        # The fingerprint is also mandatory.  It is checked again against the
-        # public key inside the decrypted archive by ``complete_install``.
-        expected_fp = self.headers.get("X-FPRO-Key-Fingerprint", "").strip()
-        if not FINGERPRINT_RE.fullmatch(expected_fp):
-            self.reject(400, "invalid fingerprint", finish=True)
-            return
-
         encrypted = server.work_dir / "ssh-key.tar.gz.enc"
         try:
             encrypted.write_bytes(payload)
             chmod_private(encrypted)
-            server.state.fingerprint = complete_install(server.args, encrypted, expected_fp)
+            server.state.fingerprint = complete_install(
+                server.args,
+                encrypted,
+                expected_fp,
+                password_override=server.password if server.password_auth else None,
+            )
             server.state.success = True
             self.send_json(
                 {"ok": True, "sha256": digest, "fingerprint": server.state.fingerprint},
@@ -758,7 +902,12 @@ def loopback_or_allowed(bind: str, allow_public: bool) -> None:
         fail("接收器默认只允许绑定回环地址；如确需公网绑定，请明确指定 --allow-public。")
 
 
-def make_receiver(args: argparse.Namespace, token: str) -> tuple[OneShotHTTPServer, ReceiverState]:
+def make_receiver(
+    args: argparse.Namespace,
+    token: str = "",
+    *,
+    password: Optional[str] = None,
+) -> tuple[OneShotHTTPServer, ReceiverState]:
     loopback_or_allowed(args.bind, args.allow_public)
     if not 0 <= args.port <= 65535:
         fail("--port 必须在 0..65535 范围内（0 表示自动选择）。")
@@ -766,12 +915,17 @@ def make_receiver(args: argparse.Namespace, token: str) -> tuple[OneShotHTTPServ
         fail("--endpoint 必须是以 / 开头且不含查询串的路径。")
     if args.max_bytes < 1 or args.max_bytes > MAX_BUNDLE_BYTES:
         fail(f"--max-bytes 必须在 1..{MAX_BUNDLE_BYTES} 范围内。")
+    if getattr(args, "password_auth", False) and not password:
+        fail("启用 password-auth 时必须提供密钥传输密码。")
+    if not getattr(args, "password_auth", False) and not token:
+        fail("传统 token 模式必须提供接收 token。")
     state = ReceiverState()
     try:
         server = OneShotHTTPServer(
             (args.bind, args.port),
             UploadHandler,
             token=token,
+            password=password,
             args=args,
             state=state,
         )
@@ -783,26 +937,36 @@ def make_receiver(args: argparse.Namespace, token: str) -> tuple[OneShotHTTPServ
 def run_listener(args: argparse.Namespace, *, wait_for_completion: bool = True) -> int:
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         fail("--timeout 必须是正数秒。")
-    # Generate a token only when no token source was requested.  When the
-    # caller supplies --token-file/--token-stdin/--token-env, honor that
-    # source just like the proxy and fetch commands do.
+    password_auth = bool(getattr(args, "password_auth", False))
     token_sources = (
         getattr(args, "token", None),
         getattr(args, "token_file", None),
         getattr(args, "token_stdin", False),
         getattr(args, "token_env", None),
     )
-    token = (
-        validate_token(read_secret(args, kind="token"))
-        if any(token_sources)
-        else secrets.token_urlsafe(32)
-    )
-    server, state = make_receiver(args, token)
+    if password_auth and any(token_sources):
+        fail("password-auth 不能同时指定接收 token 参数。")
+    password = package_password(args) if password_auth else None
+    if password_auth:
+        token = ""
+    else:
+        # Generate a token only when no token source was requested.  When the
+        # caller supplies --token-file/--token-stdin/--token-env, honor that
+        # source just like the proxy and fetch commands do.
+        token = (
+            validate_token(read_secret(args, kind="token"))
+            if any(token_sources)
+            else secrets.token_urlsafe(32)
+        )
+    server, state = make_receiver(args, token, password=password)
     host, port = server.server_address[:2]
     print(f"本机接收器已监听: {host}:{port}{args.endpoint}")
-    print(f"一次性 token（只显示本次）: {token}")
     print(f"FPRO_SSH_RECEIVER_URL=http://<fpro-server-host>:<remote-port>{args.endpoint}")
-    print(f"FPRO_SSH_RECEIVER_TOKEN={token}")
+    if password_auth:
+        print("接收认证: 密钥传输密码 challenge-response（无需复制 token）")
+    else:
+        print(f"一次性 token（只显示本次）: {token}")
+        print(f"FPRO_SSH_RECEIVER_TOKEN={token}")
     sys.stdout.flush()
 
     server.schedule_shutdown(args.timeout)
@@ -912,13 +1076,21 @@ def url_host(host: str) -> str:
     return host
 
 
-def wait_for_health(host: str, port: int, token: str, timeout: float) -> bool:
-    """Wait for the actual authenticated receiver, not a bare TCP socket.
+def wait_for_health(
+    host: str,
+    port: int,
+    token: Optional[str],
+    timeout: float,
+    *,
+    password_auth: bool = False,
+) -> bool:
+    """Wait for the actual receiver HTTP path, not a bare TCP socket.
 
     A bare ``connect()`` creates a work connection in fpro and then closes it
     without sending an HTTP request.  Depending on timing, that half-open
-    connection can delay the first real upload.  A token-authenticated health
-    request exercises the complete path and is cleanly closed by the receiver.
+    connection can delay the first real upload.  The health request exercises
+    the complete path and is cleanly closed by the receiver.  Legacy token
+    mode adds its token header; password-auth mode intentionally does not.
     """
     if timeout <= 0:
         return False
@@ -927,14 +1099,12 @@ def wait_for_health(host: str, port: int, token: str, timeout: float) -> bool:
     while time.monotonic() < deadline:
         remaining = max(0.1, deadline - time.monotonic())
         try:
-            request = urllib.request.Request(
-                url,
-                method="GET",
-                headers={
-                    "X-FPRO-Transfer-Token": token,
-                    "Connection": "close",
-                },
-            )
+            headers = {"Connection": "close"}
+            if not password_auth:
+                if not token:
+                    return False
+                headers["X-FPRO-Transfer-Token"] = token
+            request = urllib.request.Request(url, method="GET", headers=headers)
             with urllib.request.urlopen(request, timeout=min(3.0, remaining)) as response:
                 body = response.read(1024)
                 if response.status != 200:
@@ -978,18 +1148,36 @@ def start_fpro_proxy(args: argparse.Namespace) -> int:
         fail("--proxy-timeout 必须是正数秒。")
     if not math.isfinite(args.response_grace) or args.response_grace < 0:
         fail("--response-grace 必须是非负数秒。")
-    receiver_token = validate_token(read_secret(args, kind="token"))
+    password_auth = bool(getattr(args, "password_auth", False))
+    token_sources = (
+        getattr(args, "token", None),
+        getattr(args, "token_file", None),
+        getattr(args, "token_stdin", False),
+        getattr(args, "token_env", None),
+    )
+    if password_auth and any(token_sources):
+        fail("password-auth 不能同时指定接收 token 参数。")
+    if password_auth:
+        # Read the shared package password once.  It is used only to verify
+        # the upload challenge proof and to decrypt the received bundle; it is
+        # never printed or placed in the fpro command line.
+        package_pass = package_password(args)
+        receiver_token = ""
+    else:
+        package_pass = None
+        receiver_token = validate_token(read_secret(args, kind="token"))
     fpro_token = validate_fpro_token(read_secret(args, kind="fpro_token"))
     for path_arg in (args.tls_cert, args.tls_key, args.tls_ca):
         if not pathlib.Path(path_arg).expanduser().is_file():
             fail(f"TLS 文件不存在：{path_arg}")
 
-    server, state = make_receiver(args, receiver_token)
+    server, state = make_receiver(args, receiver_token, password=package_pass)
     local_host, local_port = server.server_address[:2]
     temp_dir = pathlib.Path(tempfile.mkdtemp(prefix="fpro-key-proxy-"))
-    receiver_token_file = temp_dir / "receiver-token"
-    receiver_token_file.write_text(receiver_token + "\n", encoding="utf-8")
-    chmod_private(receiver_token_file)
+    if not password_auth:
+        receiver_token_file = temp_dir / "receiver-token"
+        receiver_token_file.write_text(receiver_token + "\n", encoding="utf-8")
+        chmod_private(receiver_token_file)
     fpro_token_file = temp_dir / "fpro-auth-token"
     fpro_token_file.write_text(fpro_token + "\n", encoding="utf-8")
     chmod_private(fpro_token_file)
@@ -1047,7 +1235,11 @@ def start_fpro_proxy(args: argparse.Namespace) -> int:
             stderr=subprocess.STDOUT,
         )
         if not wait_for_health(
-            args.server_addr, args.remote_port, receiver_token, args.proxy_timeout
+            args.server_addr,
+            args.remote_port,
+            receiver_token if not password_auth else None,
+            args.proxy_timeout,
+            password_auth=password_auth,
         ):
             detail = read_text_tail(log_file)
             fail(f"临时 fpro 端口未上线。客户端日志：{detail}")
@@ -1062,9 +1254,12 @@ def start_fpro_proxy(args: argparse.Namespace) -> int:
         # even when a Windows code page is misconfigured.
         print(READY_MARKER)
         print(f"临时 fpro 通道已建立: {remote_url_host}:{args.remote_port}")
-        print(f"请将以下变量传给容器内 install.sh（token 不要写入 Git）：")
+        print("请将以下变量传给容器内 install.sh（不要写入 Git）：")
         print(f"FPRO_SSH_RECEIVER_URL=http://{remote_url_host}:{args.remote_port}{args.endpoint}")
-        print(f"FPRO_SSH_RECEIVER_TOKEN={receiver_token}")
+        if password_auth:
+            print("接收认证: 使用与配置包相同的密钥传输密码（自动 challenge-response）")
+        else:
+            print(f"FPRO_SSH_RECEIVER_TOKEN={receiver_token}")
         print("等待一次性密钥包传输……")
         sys.stdout.flush()
         while not state.done.wait(0.25):
@@ -1163,6 +1358,11 @@ def build_parser() -> argparse.ArgumentParser:
     listen.add_argument("--bind", default="127.0.0.1")
     listen.add_argument("--port", type=int, default=0)
     listen.add_argument("--endpoint", default="/v1/ssh-key")
+    listen.add_argument(
+        "--password-auth",
+        action="store_true",
+        help="使用配置包密码的 challenge-response，不生成/要求接收 token",
+    )
     listen.add_argument("--allow-public", action="store_true")
     listen.add_argument(
         "--timeout",
@@ -1190,6 +1390,11 @@ def build_parser() -> argparse.ArgumentParser:
     proxy.add_argument("--bind", default="127.0.0.1")
     proxy.add_argument("--port", type=int, default=0)
     proxy.add_argument("--endpoint", default="/v1/ssh-key")
+    proxy.add_argument(
+        "--password-auth",
+        action="store_true",
+        help="使用配置包密码的 challenge-response，不生成/要求接收 token",
+    )
     proxy.add_argument("--allow-public", action="store_true")
     proxy.add_argument(
         "--proxy-timeout",

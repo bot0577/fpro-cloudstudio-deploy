@@ -13,11 +13,11 @@ Cloud Studio 容器重启后，容器内的 `fpro-client`、`sshd` 和隧道进�
 构建后生成 `dist/FProCloudStudio.exe`。Windows 操作者通常只需双击该文件，
 输入一次“密钥传输密码”并点击“启动临时通道”；这是唯一必填项。程序会按本机架构下载加密客户端、
 解密配置并启动本机一次性 fpro 通道和文件接收器。配置准备完成后，窗口中的 **复制 bash 命令**
-和 **复制一次性 token** 按钮会立即变为可用（无需等到后台健康检查结束）；通道就绪后命令还会自动复制一次。
+按钮会立即变为可用（无需等到后台健康检查结束）；通道就绪后命令还会自动复制一次。
 操作者直接粘贴到 Cloud Studio 容器终端即可；程序不会控制浏览器、CDP 或终端。
 临时接收通道默认在真正就绪后保持 60 分钟，成功收到加密密钥包或点击“停止”才会立即关闭；
 可在高级设置中调整保持时间（最长 24 小时）。
-安装脚本完成后，程序接收并解密 SSH 私钥到 `%USERPROFILE%\.ssh`。通常无需填写端口、服务器地址或 token。
+安装脚本完成后，程序接收并解密 SSH 私钥到 `%USERPROFILE%\.ssh`。通常无需填写端口或服务器地址，也无需手动填写文件接收 token。
 
 EXE 内置解密和密钥校验逻辑，不要求另外安装 Python 或 OpenSSL；网络访问和
 Cloud Studio 登录仍须由操作者提供。构建命令及高级/手动流程见
@@ -231,20 +231,18 @@ ssh -i ~/.ssh/fpro-cloudstudio -p <remote-port> root@<tunnel-host>
 Windows 直接运行 EXE 即可完成下面的接收器和临时代理启动；不需要手动启动
 `tools/fpro_ssh_receiver.py`。EXE 会在本机回环地址启动一次性 HTTP 接收器，
 再用临时的 fpro TCP 代理把一个未占用的远端端口转回该接收器。加密包抵达后，
-接收器在本机校验 token、SHA-256、SSH 指纹以及私钥/公钥匹配关系，再解密安装私钥；
-解压密码从不通过网络发送。
+接收器在本机校验密码 challenge-response、SHA-256、SSH 指纹以及私钥/公钥匹配关系，
+再解密安装私钥；解压密码本身从不通过网络发送。
 
 Cloud Studio 的命令必须由操作者手动粘贴并执行。命令通过 HTTPS 获取 `install.sh`，
-脚本会以 ASCII 提示 `FPRO package password` 和 `FPRO one-time transfer token`，要求输入与 EXE 中相同的密钥传输密码和一次性 token。EXE 的“复制一次性 token”
-按钮只在当前通道有效。该临时通道只负责传回加密 SSH 密钥包，不承载后续 SSH 会话；接收完成后通道会立即关闭，
+脚本只以 ASCII 提示 `FPRO package password`，要求输入与 EXE 中相同的密钥传输密码；不再需要复制、粘贴或手工填写文件接收 token。密码与接收器 challenge、密钥包 SHA-256 和 SSH 指纹组合后计算一次性 HMAC proof，
+因此密码不会出现在命令行、剪贴板或 shell history 中。EXE 的“复制 bash 命令”按钮可随时再次复制。该临时通道只负责传回加密 SSH 密钥包，不承载后续 SSH 会话；接收完成后通道会立即关闭，
 容器内的持久 fpro/SSH 映射由看门狗继续维持。为避免 Cloud Studio 冷启动、下载或安装耗时造成中断，
 默认超时是通道就绪后的 60 分钟（高级设置可调整，最长 24 小时）。
 
-先在本机准备仅自己可读的 token、配置包密码和 mTLS 文件（这些文件不得提交到
-Git）：
+手动使用 CLI 接收器时，只需准备配置包密码和 mTLS 文件（这些文件不得提交到 Git）：
 
 ```text
-<receiver-token-file>       一次性随机 token（仅用于本次 HTTP 接收）
 <fpro-auth-token-file>      fpro 服务端认证 token（从加密载荷取出）
 <package-password-file>     fpro-deploy.tar.gz.enc 的密码
 <client.crt> <client.key> <ca.crt>    临时 fpro 客户端的 TLS 材料
@@ -263,33 +261,32 @@ python tools/fpro_ssh_receiver.py proxy \
   --tls-key <path-to-client.key> \
   --tls-ca <path-to-ca.crt> \
   --tls-server-name <tls-server-name> \
-  --token-file <receiver-token-file> \
   --fpro-token-file <fpro-auth-token-file> \
   --password-file <package-password-file> \
+  --password-auth \
   --ssh-dir ~/.ssh \
   --key-name fpro-cloudstudio
 ```
 
-`--token-file` 是本次接收器的一次性随机 token；`--fpro-token-file` 是 fpro
-客户端连接服务端所需的长期认证 token，二者必须不同。fpro token 只从本机受保护
-的解密载荷读取，不传给 Cloud Studio。工具会先用带 token 的 `/healthz` 请求确认完整 HTTP 路径可用，不使用会占用
-首个 work connection 的裸 TCP 探测。启动后它会打印本次临时通道的 URL 和 token；
-只在目标容器的当前进程环境中使用它们：
+`--password-auth` 让接收器使用配置包密码的 challenge-response；`--fpro-token-file`
+仍是 fpro 客户端连接服务端所需的内部认证 token，只从本机受保护的解密载荷读取，
+不会传给 Cloud Studio。工具会先请求 `/healthz` 确认完整 HTTP 路径可用，不使用会占用
+首个 work connection 的裸 TCP 探测。启动后只需把 URL 交给容器安装脚本：
 
 ```bash
 sudo env \
   FPRO_SSH_GENERATE=1 \
   FPRO_SSH_RECEIVER_URL="http://<fpro-server-host>:<unused-remote-port>/v1/ssh-key" \
-  FPRO_SSH_RECEIVER_TOKEN="<one-time-token>" \
+  FPRO_SSH_RECEIVER_AUTH=password \
   bash install.sh
 ```
 
-若不希望 token 出现在容器 shell 命令行，可将它暂存到容器内权限为 `600` 的
-临时文件，并改用 `FPRO_SSH_RECEIVER_TOKEN_FILE=/path/to/token`；安装结束后
-删除该文件。临时 token 文件不要放进 Git 或共享工作区。
-
-默认情况下，容器端输入的配置包密码必须与本机 `--password-file` 内容相同；如果
-设置了 `FPRO_SSH_EXPORT_PASSWORD`，则 `--password-file` 应填写这个单独的导出密码。
+容器端输入的配置包密码必须与本机 `--password-file` 内容相同。password-auth
+模式下 SSH 导出包也强制使用这个密码，从而整个流程只需一个密码。旧版 CLI 如需
+兼容，仍可显式设置 `FPRO_SSH_RECEIVER_TOKEN(_FILE)` 使用传统 token 模式；EXE
+默认不会生成、显示或要求该 token。
+password-auth 自动交付需要容器提供 `python3`；缺少时脚本会明确报错，不会把密码
+降级放到命令行参数中。
 安装脚本会把
 临时生成的 SSH 私钥打成单独的加密包并 POST 到上述端点；本机接收器收到并验证
 后自动解密写入 `--ssh-dir`，随后临时 fpro 客户端自动退出。成功时无需下载文件；
@@ -305,10 +302,10 @@ python tools/fpro_ssh_receiver.py decrypt \
   --ssh-dir ~/.ssh
 ```
 
-接收器默认只绑定 `127.0.0.1`，使用一次性随机 token、必需的 SHA-256 与 SSH 指纹
-头、大小限制、路径穿越/软链接检查、私钥与 `.pub` 匹配检查以及原子写入。只有明确指定 `--allow-public` 才会
-允许监听非回环地址；即使如此，仍应依赖 fpro TLS、随机 token 和加密包密码共同
-保护传输。
+接收器默认只绑定 `127.0.0.1`，使用短时 challenge-response proof、必需的
+SHA-256 与 SSH 指纹头、大小限制、路径穿越/软链接检查、私钥与 `.pub` 匹配检查
+以及原子写入。只有明确指定 `--allow-public` 才会允许监听非回环地址；即使如此，
+仍应依赖 fpro TLS 和加密包密码共同保护传输。
 
 ## 安全约定
 

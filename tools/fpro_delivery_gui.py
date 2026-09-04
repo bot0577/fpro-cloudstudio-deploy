@@ -19,7 +19,6 @@ import pathlib
 import platform
 import queue
 import re
-import secrets
 import shutil
 import subprocess
 import sys
@@ -339,12 +338,13 @@ def make_remote_command(
     receiver_url: str,
     key_name: str = KEY_NAME_DEFAULT,
 ) -> str:
-    """Build a one-paste bootstrap command with two hidden prompts.
+    """Build a one-paste bootstrap command with one hidden prompt.
 
-    The first prompt captures the package password into a temporary file; the
-    second captures the one-shot receiver token.  Neither secret appears in
-    shell history or the command text.  The command is copied to the
-    clipboard and run manually in the Cloud Studio terminal.
+    The password is captured into a temporary file and is reused by the
+    container-side installer for the receiver's challenge-response proof.
+    There is no separately copied file-transfer token.  The password never
+    appears in shell history or the command text.  The command is copied to
+    the clipboard and run manually in the Cloud Studio terminal.
     """
     if not KEY_NAME_RE.fullmatch(key_name):
         raise AppError("SSH 密钥名只能包含字母、数字、点、下划线和连字符。")
@@ -357,22 +357,18 @@ def make_remote_command(
     return (
         "set -o pipefail; umask 077; "
         "FPRO_PW_FILE=\"$(mktemp)\" || exit 1; "
-        "FPRO_TOKEN_FILE=\"$(mktemp)\" || { rm -f -- \"$FPRO_PW_FILE\"; exit 1; }; "
-        "trap 'rm -f -- \"$FPRO_PW_FILE\" \"$FPRO_TOKEN_FILE\"' EXIT HUP INT TERM; "
+        "trap 'rm -f -- \"$FPRO_PW_FILE\"' EXIT HUP INT TERM; "
         # Keep prompts ASCII: Cloud Studio terminals may use a different
         # locale, and an ASCII command is never rendered as mojibake there.
         "printf '\\nFPRO package password: '; read -r -s FPRO_PACKAGE_PASSWORD; "
         "printf '%s' \"$FPRO_PACKAGE_PASSWORD\" >\"$FPRO_PW_FILE\"; "
         "unset FPRO_PACKAGE_PASSWORD; "
-        "printf '\\nFPRO one-time transfer token: '; read -r -s FPRO_TRANSFER_TOKEN; "
-        "printf '%s\\n' \"$FPRO_TRANSFER_TOKEN\" >\"$FPRO_TOKEN_FILE\"; "
-        "unset FPRO_TRANSFER_TOKEN; "
         f"{fetch_script} | sudo env "
         "FPRO_PACKAGE_PASSWORD_FILE=\"$FPRO_PW_FILE\" "
         "FPRO_SSH_GENERATE=1 "
         f"FPRO_SSH_KEY_NAME={shell_quote(key_name)} "
         f"FPRO_SSH_RECEIVER_URL={shell_quote(receiver_url)} "
-        "FPRO_SSH_RECEIVER_TOKEN_FILE=\"$FPRO_TOKEN_FILE\" "
+        "FPRO_SSH_RECEIVER_AUTH=password "
         "FPRO_SSH_RECEIVER_TIMEOUT=90 bash; "
         "rc=$?; exit $rc"
     )
@@ -387,8 +383,6 @@ class PreparedAssets:
     ca_crt: pathlib.Path
     fpro_token: pathlib.Path
     package_password: pathlib.Path
-    receiver_token: pathlib.Path
-    receiver_token_value: str
     server_addr: str
     server_port: int
     tls_server_name: str
@@ -430,7 +424,6 @@ class DeliveryApp(tk.Tk):
         self.worker: Optional[subprocess.Popen[bytes]] = None
         self.worker_thread: Optional[threading.Thread] = None
         self.proxy_ready = False
-        self.current_token = ""
         self.current_url = ""
         self.current_command = ""
         self.command_placeholder = (
@@ -570,13 +563,6 @@ class DeliveryApp(tk.Tk):
             state="disabled",
         )
         self.copy_button.pack(side="left")
-        self.copy_token_button = ttk.Button(
-            command_buttons,
-            text="复制一次性 token",
-            command=self.copy_token,
-            state="disabled",
-        )
-        self.copy_token_button.pack(side="left", padx=(8, 0))
 
         self.status_var = tk.StringVar(value="就绪")
         self.status_label = ttk.Label(outer, textvariable=self.status_var, foreground="#1f5f9e")
@@ -626,11 +612,9 @@ class DeliveryApp(tk.Tk):
         if not self.current_url:
             return
         self.copy_button.configure(state="normal" if self.current_command else "disabled")
-        self.copy_token_button.configure(state="normal" if self.current_token else "disabled")
 
     def hide_command_controls(self) -> None:
         self.copy_button.configure(state="disabled")
-        self.copy_token_button.configure(state="disabled")
         self.set_command_preview(self.command_placeholder)
 
     def toggle_advanced(self) -> None:
@@ -682,8 +666,6 @@ class DeliveryApp(tk.Tk):
             self.binary_var.set(path)
 
     def log(self, message: str) -> None:
-        if self.current_token:
-            message = message.replace(self.current_token, "<一次性 token 已隐藏>")
         self.log_text.configure(state="normal")
         self.log_text.insert("end", message + "\n")
         self.log_text.see("end")
@@ -703,19 +685,18 @@ class DeliveryApp(tk.Tk):
                 elif event == "ready":
                     self.on_proxy_ready()
                 elif event == "command_preview":
-                    # The receiver URL and one-shot token are known before the
-                    # fpro child has finished its health check.  Publish both
-                    # on the Tk thread so the copy buttons are usable while
-                    # the tunnel is still coming up (and do not remain grey
-                    # forever if a legacy client does not emit READY_MARKER).
+                    # The receiver URL is known before the fpro child has
+                    # finished its health check.  Publish the command on the
+                    # Tk thread so the copy button is usable while the tunnel
+                    # is still coming up (and does not remain grey forever if
+                    # a legacy client does not emit READY_MARKER).
                     if isinstance(value, dict):
                         self.current_url = str(value.get("url", ""))
                         self.current_command = str(value.get("command", ""))
-                        self.current_token = str(value.get("token", ""))
                         if self.current_command:
                             self.set_command_preview(self.current_command)
                         self.show_command_controls()
-                        self.status_var.set("正在建立一次性 fpro 通道；命令和 token 已可复制")
+                        self.status_var.set("正在建立一次性 fpro 通道；bash 命令已可复制")
                     elif self.prepared is not None:
                         # Keep accepting the old string payload for callers
                         # and test harnesses that only provide a preview text.
@@ -797,7 +778,6 @@ class DeliveryApp(tk.Tk):
         self.stop_button.configure(state="normal")
         self.hide_command_controls()
         self.proxy_ready = False
-        self.current_token = ""
         self.current_url = ""
         self.current_command = ""
         self.status_var.set("正在准备加密载荷…")
@@ -858,9 +838,6 @@ class DeliveryApp(tk.Tk):
                 selected=options.binary,
                 log=lambda s: self.post("log", s),
             )
-            receiver_token_value = secrets.token_urlsafe(32)
-            receiver_token = temp_root / "receiver-token"
-            write_private(receiver_token, receiver_token_value + "\n")
             package_password = temp_root / "package-password"
             write_private(package_password, password)
             fpro_token = payload / "certs" / "auth-token"
@@ -883,8 +860,6 @@ class DeliveryApp(tk.Tk):
                 ca_crt=payload / "certs" / "ca.crt",
                 fpro_token=fpro_token,
                 package_password=package_password,
-                receiver_token=receiver_token,
-                receiver_token_value=receiver_token_value,
                 server_addr=server_addr,
                 server_port=server_port,
                 tls_server_name=tls_name,
@@ -902,7 +877,6 @@ class DeliveryApp(tk.Tk):
                 {
                     "url": preview_url,
                     "command": preview_command,
-                    "token": receiver_token_value,
                 },
             )
             self.post("set", ("server", server_addr))
@@ -928,12 +902,11 @@ class DeliveryApp(tk.Tk):
                 str(assets.ca_crt),
                 "--tls-server-name",
                 tls_name,
-                "--token-file",
-                str(receiver_token),
                 "--fpro-token-file",
                 str(fpro_token),
                 "--password-file",
                 str(package_password),
+                "--password-auth",
                 "--ssh-dir",
                 options.ssh_dir or str(pathlib.Path.home() / ".ssh"),
                 "--key-name",
@@ -1047,7 +1020,7 @@ class DeliveryApp(tk.Tk):
         self.show_command_controls()
         self.status_var.set("临时通道已建立，请在 Cloud Studio 终端执行安装命令")
         self.log("临时通道已建立；bash 命令已显示并复制到剪贴板。")
-        self.log("请把命令粘贴到 Cloud Studio 终端并回车，按提示输入密码和一次性 token。")
+        self.log("请把命令粘贴到 Cloud Studio 终端并回车；按提示输入同一个密钥传输密码即可。")
 
     def copy_command(self) -> None:
         if not self.current_command:
@@ -1056,14 +1029,6 @@ class DeliveryApp(tk.Tk):
         self.clipboard_append(self.current_command)
         self.update()
         self.log("bash 命令已复制。")
-
-    def copy_token(self) -> None:
-        if not self.current_token:
-            return
-        self.clipboard_clear()
-        self.clipboard_append(self.current_token)
-        self.update()
-        self.log("一次性 token 已复制；仅在 Cloud Studio 的 token 提示处粘贴。")
 
     def on_worker_done(self, code: int) -> None:
         self.worker = None
@@ -1105,7 +1070,6 @@ class DeliveryApp(tk.Tk):
         root = self.temp_root
         self.temp_root = None
         self.prepared = None
-        self.current_token = ""
         self.current_url = ""
         self.current_command = ""
         if root is not None:
@@ -1133,13 +1097,27 @@ def self_test() -> int:
     assert select_temp_port(None, 22) == DEFAULT_TEMP_PORT_MIN
     assert select_temp_port(8123, 7022) == 8123
     command = make_remote_command(DEFAULT_RAW_BASE, "http://example.invalid:12345/v1/ssh-key")
-    assert "FPRO_SSH_RECEIVER_TOKEN_FILE" in command
     assert "FPRO_PACKAGE_PASSWORD_FILE" in command
+    assert "FPRO_SSH_RECEIVER_AUTH=password" in command
     assert "mktemp" in command and "trap 'rm -f" in command
     assert "FPRO package password" in command
-    assert "FPRO one-time transfer token" in command
+    assert "FPRO one-time transfer token" not in command
+    assert "FPRO_SSH_RECEIVER_TOKEN" not in command
     assert "automate_cloudstudio" not in command
     assert "example.invalid" in command
+    proof = fpro_ssh_receiver.password_proof(
+        "test-password",
+        "A" * 43,
+        "0" * 64,
+        "SHA256:test",
+    )
+    assert fpro_ssh_receiver.PROOF_RE.fullmatch(proof)
+    assert fpro_ssh_receiver.password_proof(
+        "test-password",
+        "A" * 43,
+        "0" * 64,
+        "SHA256:other",
+    ) != proof
     assert decode_worker_line("临时 fpro 通道已建立".encode("gb18030")) == "临时 fpro 通道已建立"
     assert decode_worker_line(WORKER_READY_MARKER.encode("ascii")) == WORKER_READY_MARKER
     named_command = make_remote_command(
