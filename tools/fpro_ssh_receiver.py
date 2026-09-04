@@ -699,7 +699,20 @@ def make_receiver(args: argparse.Namespace, token: str) -> tuple[OneShotHTTPServ
 def run_listener(args: argparse.Namespace, *, wait_for_completion: bool = True) -> int:
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         fail("--timeout 必须是正数秒。")
-    token = validate_token(args.token) if args.token else secrets.token_urlsafe(32)
+    # Generate a token only when no token source was requested.  When the
+    # caller supplies --token-file/--token-stdin/--token-env, honor that
+    # source just like the proxy and fetch commands do.
+    token_sources = (
+        getattr(args, "token", None),
+        getattr(args, "token_file", None),
+        getattr(args, "token_stdin", False),
+        getattr(args, "token_env", None),
+    )
+    token = (
+        validate_token(read_secret(args, kind="token"))
+        if any(token_sources)
+        else secrets.token_urlsafe(32)
+    )
     server, state = make_receiver(args, token)
     host, port = server.server_address[:2]
     print(f"本机接收器已监听: {host}:{port}{args.endpoint}")

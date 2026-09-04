@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""One-click Windows front end for Cloud Studio SSH key delivery.
+"""Windows front end for one-shot Cloud Studio SSH key delivery.
 
 The GUI deliberately keeps secrets out of command lines and configuration
 files.  It downloads the encrypted repository artifacts, decrypts only the
-short-lived local staging copy, starts the one-shot receiver/proxy, and (when
-Chrome remote debugging is available) types the bootstrap flow into the open
-Cloud Studio terminal.  The receiver worker remains in
-``fpro_ssh_receiver.py`` so the CLI and the packaged app use the same checks.
+short-lived local staging copy, starts the one-shot receiver/proxy, and copies
+the bootstrap command for the operator to run in the Cloud Studio terminal.
+The browser/terminal is never controlled automatically.  The receiver worker
+remains in ``fpro_ssh_receiver.py`` so the CLI and the packaged app use the
+same checks.
 """
 
 from __future__ import annotations
 
 import io
 import json
-import math
 import os
 import pathlib
 import platform
@@ -26,7 +26,6 @@ import sys
 import tarfile
 import tempfile
 import threading
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -52,7 +51,7 @@ except ImportError:  # pragma: no cover - package-relative import
     from . import fpro_ssh_receiver  # noqa: F401
 
 
-APP_NAME = "FPRO Cloud Studio 一键交付"
+APP_NAME = "FPRO Cloud Studio 临时通道"
 DEFAULT_RAW_BASE = "https://raw.githubusercontent.com/bot0577/fpro-cloudstudio-deploy/main"
 CONFIG_ARTIFACT = "fpro-deploy.tar.gz.enc"
 MAX_CONFIG_BYTES = 512 * 1024 * 1024
@@ -61,13 +60,6 @@ KEY_NAME_DEFAULT = "fpro-cloudstudio"
 KEY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,96}$")
 DEFAULT_TEMP_PORT_MIN = 7001
 DEFAULT_TEMP_PORT_MAX = 7499
-CDP_AUTO_WAIT_SECONDS = 30
-DEFAULT_CDP_ENDPOINTS = (
-    "http://127.0.0.1:9222",
-    "http://127.0.0.1:9333",
-    "http://127.0.0.1:9223",
-    "http://127.0.0.1:9224",
-)
 
 
 class AppError(RuntimeError):
@@ -157,20 +149,6 @@ def normalize_raw_base(value: str) -> str:
     if parsed.scheme != "https" or not parsed.netloc or parsed.query or parsed.fragment:
         raise AppError("Raw 地址必须是 HTTPS URL。")
     return value
-
-
-def cdp_endpoint_candidates(configured: str) -> list[str]:
-    """Return unique local CDP endpoints, with common ports as fallbacks."""
-    values: list[str] = []
-    if configured.strip():
-        values.append(configured.strip().rstrip("/"))
-    values.extend(DEFAULT_CDP_ENDPOINTS)
-    result: list[str] = []
-    for value in values:
-        value = value.rstrip("/")
-        if value and value not in result:
-            result.append(value)
-    return result
 
 
 def write_private(path: pathlib.Path, data: bytes | str) -> None:
@@ -335,8 +313,8 @@ def make_remote_command(
 
     The first prompt captures the package password into a temporary file; the
     second captures the one-shot receiver token.  Neither secret appears in
-    shell history or the command text.  The packaged GUI normally fills both
-    prompts through CDP, so the operator only enters one password in the app.
+    shell history or the command text.  The command is copied to the
+    clipboard and run manually in the Cloud Studio terminal.
     """
     if not KEY_NAME_RE.fullmatch(key_name):
         raise AppError("SSH 密钥名只能包含字母、数字、点、下划线和连字符。")
@@ -384,8 +362,6 @@ class PreparedAssets:
     ssh_port: Optional[int]
     remote_port: int
     raw_base: str
-    cdp_endpoint: str
-    auto_cdp: bool
 
 
 @dataclass(frozen=True)
@@ -399,8 +375,6 @@ class RunOptions:
     tls_server_name: str
     ssh_dir: str
     key_name: str
-    cdp_endpoint: str
-    auto_cdp: bool
 
 
 def worker_command(args: list[str]) -> list[str]:
@@ -422,7 +396,6 @@ class DeliveryApp(tk.Tk):
         self.proxy_ready = False
         self.current_token = ""
         self.current_url = ""
-        self.current_password = ""
         self.prepared: Optional[PreparedAssets] = None
         self.temp_root: Optional[pathlib.Path] = None
         self.load_settings()
@@ -445,16 +418,14 @@ class DeliveryApp(tk.Tk):
         self.tls_name_var = tk.StringVar(value=str(values.get("tls_server_name", "")))
         self.ssh_dir_var = tk.StringVar(value=str(values.get("ssh_dir", pathlib.Path.home() / ".ssh")))
         self.key_name_var = tk.StringVar(value=str(values.get("key_name", KEY_NAME_DEFAULT)))
-        self.cdp_var = tk.StringVar(value=str(values.get("cdp", "http://127.0.0.1:9222")))
-        self.auto_cdp_var = tk.BooleanVar(value=bool(values.get("auto_cdp", True)))
 
     def build_ui(self) -> None:
         outer = ttk.Frame(self, padding=14)
         outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="fpro Cloud Studio 一键 SSH 密钥交付", font=("Segoe UI", 16, "bold")).pack(anchor="w")
+        ttk.Label(outer, text="fpro Cloud Studio 临时通道与 SSH 密钥交付", font=("Segoe UI", 16, "bold")).pack(anchor="w")
         ttk.Label(
             outer,
-            text="只需填写一个密钥传输密码并点击“开始一键部署”；其余参数和临时 token 由程序自动处理。",
+            text="输入密钥传输密码后点击开始；程序只建立本机临时通道并接收密钥，不会自动控制 Cloud Studio。",
             foreground="#555555",
         ).pack(anchor="w", pady=(2, 12))
 
@@ -483,53 +454,44 @@ class DeliveryApp(tk.Tk):
             self.temp_port_var,
             hint="留空自动选择；仅在自定义服务端时填写",
         )
-        self.add_row(
-            advanced,
-            1,
-            "Cloud Studio 自动执行",
-            "check",
-            self.auto_cdp_var,
-            hint="检测到本机 Chrome CDP 时自动输入命令",
-        )
-        self.add_row(advanced, 2, "本地仓库目录", "browse", self.repo_var, self.browse_repo)
-        self.add_row(advanced, 3, "本机 fpro-client.exe", "browse", self.binary_var, self.browse_binary)
-        self.add_row(advanced, 4, "服务端地址覆盖", "entry", self.server_var, hint="留空则从加密配置读取")
-        self.add_row(advanced, 5, "控制端口覆盖", "entry", self.server_port_var, hint="留空则从加密配置读取")
-        self.add_row(advanced, 6, "TLS Server Name 覆盖", "entry", self.tls_name_var, hint="留空则从加密配置读取")
-        self.add_row(advanced, 7, "SSH 私钥目录", "entry", self.ssh_dir_var)
-        self.add_row(advanced, 8, "SSH 密钥名", "entry", self.key_name_var)
-        self.add_row(advanced, 9, "Chrome CDP 地址", "entry", self.cdp_var)
-        self.add_row(advanced, 10, "Raw 基础地址", "entry", self.raw_var)
+        self.add_row(advanced, 1, "本地仓库目录", "browse", self.repo_var, self.browse_repo)
+        self.add_row(advanced, 2, "本机 fpro-client.exe", "browse", self.binary_var, self.browse_binary)
+        self.add_row(advanced, 3, "服务端地址覆盖", "entry", self.server_var, hint="留空则从加密配置读取")
+        self.add_row(advanced, 4, "控制端口覆盖", "entry", self.server_port_var, hint="留空则从加密配置读取")
+        self.add_row(advanced, 5, "TLS Server Name 覆盖", "entry", self.tls_name_var, hint="留空则从加密配置读取")
+        self.add_row(advanced, 6, "SSH 私钥目录", "entry", self.ssh_dir_var)
+        self.add_row(advanced, 7, "SSH 密钥名", "entry", self.key_name_var)
+        self.add_row(advanced, 8, "Raw 基础地址", "entry", self.raw_var)
 
         buttons = ttk.Frame(outer)
         buttons.pack(fill="x", pady=(12, 8))
-        self.start_button = ttk.Button(buttons, text="开始一键部署", command=self.start)
+        self.start_button = ttk.Button(buttons, text="启动临时通道", command=self.start)
         self.start_button.pack(side="left")
         self.stop_button = ttk.Button(buttons, text="停止", command=self.stop, state="disabled")
         self.stop_button.pack(side="left", padx=(8, 0))
 
-        # Keep manual fallback controls out of the normal one-field workflow.
-        # They are revealed only when CDP auto input is unavailable (or when
-        # the operator explicitly disables auto input in Advanced settings).
-        self.fallback_frame = ttk.LabelFrame(
-            outer, text="仅在自动输入失败时使用", padding=8
+        # The browser is intentionally not automated.  These controls appear
+        # once the temporary channel is ready, so the operator can paste the
+        # bootstrap command into the Cloud Studio terminal.
+        self.command_frame = ttk.LabelFrame(
+            outer, text="Cloud Studio 安装命令", padding=8
         )
         ttk.Label(
-            self.fallback_frame,
-            text="正常情况下无需复制命令或 token。若浏览器 CDP 不可用，再按下面按钮操作。",
+            self.command_frame,
+            text="临时通道建立后，点击复制安装命令，在 Cloud Studio 终端粘贴并回车；按提示输入同一密码和一次性 token。",
             foreground="#777777",
         ).pack(anchor="w")
-        fallback_buttons = ttk.Frame(self.fallback_frame)
-        fallback_buttons.pack(fill="x", pady=(6, 0))
+        command_buttons = ttk.Frame(self.command_frame)
+        command_buttons.pack(fill="x", pady=(6, 0))
         self.copy_button = ttk.Button(
-            fallback_buttons,
-            text="复制 Cloud Studio 指令",
+            command_buttons,
+            text="复制安装命令",
             command=self.copy_command,
             state="disabled",
         )
         self.copy_button.pack(side="left")
         self.copy_token_button = ttk.Button(
-            fallback_buttons,
+            command_buttons,
             text="复制一次性 token",
             command=self.copy_token,
             state="disabled",
@@ -549,17 +511,17 @@ class DeliveryApp(tk.Tk):
         self.password_entry.focus_set()
         self.password_entry.bind("<Return>", lambda _event: self.start())
 
-    def show_manual_fallback(self) -> None:
-        """Reveal the manual controls only when the automatic path needs them."""
+    def show_command_controls(self) -> None:
+        """Reveal the manual command controls once the tunnel is ready."""
         if not self.current_url:
             return
-        if not self.fallback_frame.winfo_manager():
-            self.fallback_frame.pack(fill="x", pady=(6, 0), before=self.status_label)
+        if not self.command_frame.winfo_manager():
+            self.command_frame.pack(fill="x", pady=(6, 0), before=self.status_label)
         self.copy_button.configure(state="normal" if self.current_url else "disabled")
         self.copy_token_button.configure(state="normal" if self.current_token else "disabled")
 
-    def hide_manual_fallback(self) -> None:
-        self.fallback_frame.pack_forget()
+    def hide_command_controls(self) -> None:
+        self.command_frame.pack_forget()
         self.copy_button.configure(state="disabled")
         self.copy_token_button.configure(state="disabled")
 
@@ -630,8 +592,6 @@ class DeliveryApp(tk.Tk):
                     self.status_var.set(str(value))
                 elif event == "ready":
                     self.on_proxy_ready()
-                elif event == "fallback":
-                    self.show_manual_fallback()
                 elif event == "done":
                     self.on_worker_done(int(value))
                 elif event == "error":
@@ -654,8 +614,6 @@ class DeliveryApp(tk.Tk):
             "tls_server_name": self.tls_name_var.get().strip(),
             "ssh_dir": self.ssh_dir_var.get().strip(),
             "key_name": self.key_name_var.get().strip(),
-            "cdp": self.cdp_var.get().strip(),
-            "auto_cdp": bool(self.auto_cdp_var.get()),
         }
         try:
             target = settings_path()
@@ -694,13 +652,12 @@ class DeliveryApp(tk.Tk):
         self.save_settings()
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
-        self.hide_manual_fallback()
+        self.hide_command_controls()
         self.proxy_ready = False
         self.current_token = ""
         self.current_url = ""
-        self.current_password = password
         self.status_var.set("正在准备加密载荷…")
-        self.log("开始一键部署；密码只保存在本次进程内存和临时文件中。")
+        self.log("启动临时通道；密码只保存在本次进程内存和临时文件中。")
         options = RunOptions(
             raw_base=raw,
             temp_port=temp_port,
@@ -711,8 +668,6 @@ class DeliveryApp(tk.Tk):
             tls_server_name=self.tls_name_var.get().strip(),
             ssh_dir=self.ssh_dir_var.get().strip(),
             key_name=self.key_name_var.get().strip() or KEY_NAME_DEFAULT,
-            cdp_endpoint=self.cdp_var.get().strip(),
-            auto_cdp=bool(self.auto_cdp_var.get()),
         )
         self.worker_thread = threading.Thread(
             target=self.prepare_and_start,
@@ -793,8 +748,6 @@ class DeliveryApp(tk.Tk):
                 ssh_port=ssh_port,
                 remote_port=temp_port,
                 raw_base=options.raw_base,
-                cdp_endpoint=options.cdp_endpoint,
-                auto_cdp=options.auto_cdp,
             )
             self.prepared = assets
             self.current_token = receiver_token_value
@@ -919,21 +872,10 @@ class DeliveryApp(tk.Tk):
         self.clipboard_clear()
         self.clipboard_append(command)
         self.update()
-        # Keep the normal path to one visible input.  Manual controls are
-        # revealed only if CDP cannot complete the automatic terminal input.
-        self.copy_button.configure(state="disabled")
-        self.copy_token_button.configure(state="disabled")
-        self.status_var.set("临时通道已建立，正在等待 Cloud Studio 安装…")
-        self.log("临时通道已建立；安装指令已复制到剪贴板。")
-        if assets.auto_cdp:
-            threading.Thread(
-                target=self.automate_cloudstudio,
-                args=(command, self.current_password, self.current_token, assets.cdp_endpoint),
-                daemon=True,
-            ).start()
-        else:
-            self.show_manual_fallback()
-            self.log("请在 Cloud Studio 终端粘贴指令；密码按你刚才输入的值填写，token 可点击“复制一次性 token”后粘贴。")
+        self.show_command_controls()
+        self.status_var.set("临时通道已建立，请在 Cloud Studio 终端执行安装命令")
+        self.log("临时通道已建立；安装命令已复制到剪贴板。")
+        self.log("请把命令粘贴到 Cloud Studio 终端并回车，按提示输入同一密码和一次性 token。")
 
     def copy_command(self) -> None:
         if not self.current_url:
@@ -958,154 +900,18 @@ class DeliveryApp(tk.Tk):
         self.update()
         self.log("一次性 token 已复制；仅在 Cloud Studio 的 token 提示处粘贴。")
 
-    def automate_cloudstudio(self, command: str, password: str, token: str, cdp_endpoint: str) -> None:
-        try:
-            import websocket  # type: ignore
-        except ImportError as exc:
-            self.post("log", f"未找到 CDP 依赖，改为手动粘贴：{exc}")
-            return
-        try:
-            connection = None
-            selected_endpoint = ""
-            deadline = time.monotonic() + CDP_AUTO_WAIT_SECONDS
-            wait_logged = False
-            while connection is None and time.monotonic() < deadline:
-                for endpoint in cdp_endpoint_candidates(cdp_endpoint):
-                    try:
-                        targets_req = urllib.request.Request(endpoint + "/json/list")
-                        with urllib.request.urlopen(targets_req, timeout=2) as response:
-                            targets = json.loads(response.read().decode("utf-8"))
-                    except Exception:
-                        continue
-                    for target in targets:
-                        if target.get("type") != "page" or not target.get("webSocketDebuggerUrl"):
-                            continue
-                        candidate = None
-                        try:
-                            candidate = websocket.create_connection(target["webSocketDebuggerUrl"], timeout=5)
-                            probe = self.cdp_call(candidate, 1, "Runtime.evaluate", {
-                                "expression": "Boolean(document.querySelector(\".xterm-helper-textarea,.xterm,.xterm-screen,[aria-label*='terminal' i]\"))",
-                                "returnByValue": True,
-                            })
-                            value = probe.get("result", {}).get("result", {}).get("value")
-                            if value:
-                                connection = candidate
-                                selected_endpoint = endpoint
-                                break
-                            candidate.close()
-                        except Exception:
-                            if candidate is not None:
-                                try:
-                                    candidate.close()
-                                except Exception:
-                                    pass
-                    if connection is not None:
-                        break
-                if connection is None:
-                    if not wait_logged:
-                        self.post("log", f"正在等待 Cloud Studio 终端（最多 {CDP_AUTO_WAIT_SECONDS} 秒）…")
-                        wait_logged = True
-                    time.sleep(1.0)
-            if connection is None:
-                raise AppError("没有找到带终端的 Cloud Studio 浏览器页面。")
-            try:
-                focus = self.cdp_call(
-                    connection,
-                    2,
-                    "Runtime.evaluate",
-                    {
-                        "expression": "(() => { const e=document.querySelector('.xterm-helper-textarea')||document.querySelector('.xterm')||document.querySelector('.xterm-screen')||document.querySelector(\"[aria-label*='terminal' i]\"); if(!e)return false; e.focus(); e.click(); return true; })()",
-                        "returnByValue": True,
-                    },
-                )
-                if not focus.get("result", {}).get("result", {}).get("value"):
-                    raise AppError("找到了浏览器页面，但无法聚焦终端。")
-                self.cdp_insert(connection, command)
-                self.cdp_enter(connection)
-                if not self.cdp_wait_for_text(connection, "密钥传输密码", timeout=12):
-                    self.post("log", "未读到密码提示，按短暂等待继续输入。")
-                    time.sleep(1.0)
-                self.cdp_insert(connection, password)
-                self.cdp_enter(connection)
-                if not self.cdp_wait_for_text(connection, "一次性接收 token", timeout=12):
-                    self.post("log", "未读到 token 提示，按短暂等待继续输入。")
-                    time.sleep(1.0)
-                self.cdp_insert(connection, token)
-                self.cdp_enter(connection)
-                self.post("log", f"已通过 Chrome CDP（{selected_endpoint}）自动输入安装指令、密码和一次性 token。")
-            finally:
-                connection.close()
-        except Exception as exc:
-            self.post("log", f"CDP 自动执行未完成：{exc}")
-            self.post("fallback")
-            self.post("log", "已保留指令在剪贴板；如需继续，请在 Cloud Studio 终端粘贴一次。")
-
-    @staticmethod
-    def cdp_call(connection, ident: int, method: str, params: dict) -> dict:
-        connection.send(json.dumps({"id": ident, "method": method, "params": params}))
-        while True:
-            message = json.loads(connection.recv())
-            if message.get("id") == ident:
-                return message
-
-    @classmethod
-    def cdp_insert(cls, connection, text: str) -> None:
-        cls.cdp_call(connection, 3, "Input.insertText", {"text": text})
-
-    @classmethod
-    def cdp_enter(cls, connection) -> None:
-        for event_type in ("keyDown", "keyUp"):
-            cls.cdp_call(
-                connection,
-                4 if event_type == "keyDown" else 5,
-                "Input.dispatchKeyEvent",
-                {
-                    "type": event_type,
-                    "key": "Enter",
-                    "code": "Enter",
-                    "windowsVirtualKeyCode": 13,
-                    "nativeVirtualKeyCode": 13,
-                },
-            )
-
-    @classmethod
-    def cdp_wait_for_text(cls, connection, needle: str, *, timeout: float) -> bool:
-        """Poll xterm's accessible text so CDP input is not race-prone."""
-        deadline = time.monotonic() + max(0.1, timeout)
-        ident = 20
-        expression = (
-            "(() => { const e=document.querySelector('.xterm-rows')||"
-            "document.querySelector('.xterm'); return e ? (e.innerText || '') : ''; })()"
-        )
-        while time.monotonic() < deadline:
-            try:
-                result = cls.cdp_call(
-                    connection,
-                    ident,
-                    "Runtime.evaluate",
-                    {"expression": expression, "returnByValue": True},
-                )
-                value = result.get("result", {}).get("result", {}).get("value", "")
-                if needle in str(value):
-                    return True
-            except Exception:
-                return False
-            time.sleep(0.2)
-        return False
-
     def on_worker_done(self, code: int) -> None:
         self.worker = None
         self.stop_button.configure(state="disabled")
         self.start_button.configure(state="normal")
-        self.hide_manual_fallback()
+        self.hide_command_controls()
         if code == 0:
             self.status_var.set("完成：SSH 私钥已写入本机")
-            self.log("一次性通道已关闭；请使用 ~/.ssh 中的私钥连接实际 SSH 映射端口。")
+            self.log("一次性通道已关闭；SSH 私钥已写入本机，请使用日志中的路径连接实际 SSH 映射端口。")
         else:
             self.status_var.set("失败：请查看日志")
             self.log(f"接收器退出码：{code}")
         self.cleanup_temp()
-        self.current_password = ""
 
     def on_error(self, message: str) -> None:
         self.status_var.set("失败：请查看日志")
@@ -1127,9 +933,8 @@ class DeliveryApp(tk.Tk):
                     pass
         self.stop_button.configure(state="disabled")
         self.start_button.configure(state="normal")
-        self.hide_manual_fallback()
+        self.hide_command_controls()
         self.cleanup_temp()
-        self.current_password = ""
 
     def cleanup_temp(self) -> None:
         root = self.temp_root
@@ -1157,15 +962,10 @@ def run_worker(argv: list[str]) -> int:
 
 def self_test() -> int:
     """Non-GUI smoke checks used by the build/CI script."""
-    try:
-        import websocket  # noqa: F401 - verify the packaged CDP dependency
-    except ImportError as exc:
-        raise AssertionError(f"websocket CDP dependency is missing: {exc}") from exc
     assert windows_binary_name().startswith("fpro-client_windows_")
     assert select_temp_port(None, 7022) == 7023
     assert select_temp_port(None, 22) == DEFAULT_TEMP_PORT_MIN
     assert select_temp_port(8123, 7022) == 8123
-    assert cdp_endpoint_candidates("http://127.0.0.1:9222")[0].endswith(":9222")
     command = make_remote_command(DEFAULT_RAW_BASE, "http://example.invalid:12345/v1/ssh-key")
     assert "FPRO_SSH_RECEIVER_TOKEN_FILE" in command
     assert "FPRO_PACKAGE_PASSWORD_FILE" in command

@@ -18,7 +18,6 @@ if ($pyinstaller) {
     --name FProCloudStudio `
     --hidden-import fpro_ssh_receiver `
     --hidden-import fpro_crypto `
-    --hidden-import websocket `
     --collect-submodules cryptography `
     tools\fpro_delivery_gui.py
 

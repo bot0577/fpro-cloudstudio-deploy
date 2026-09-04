@@ -8,13 +8,13 @@ Cloud Studio 容器重启后，容器内的 `fpro-client`、`sshd` 和隧道进�
 
 > 操作者按步骤执行的速查版见 [使用说明.md](使用说明.md)。
 
-## Windows 操作者：优先使用一键 EXE
+## Windows 操作者：使用 EXE 启动临时通道
 
 构建后生成 `dist/FProCloudStudio.exe`。Windows 操作者通常只需双击该文件，
-只输入一次“密钥传输密码”并点击“开始一键部署”；这是唯一必填项，程序会按本机架构下载加密客户端，
-解密配置、启动临时 fpro 通道，自动向已打开的 Cloud Studio 终端执行安装，
-再接收并解密 SSH 私钥到 `%USERPROFILE%\.ssh`。没有 Chrome CDP 时，程序会
-把后备指令复制到剪贴板并显示手动兜底按钮；正常路径无需填写端口、服务器地址或 token。
+输入一次“密钥传输密码”并点击“启动临时通道”；这是唯一必填项。程序会按本机架构下载加密客户端、
+解密配置并启动本机一次性 fpro 通道和文件接收器，然后把 Cloud Studio 安装命令复制到剪贴板。
+操作者将命令手动粘贴到 Cloud Studio 容器终端执行；程序不会控制浏览器、CDP 或终端。
+安装脚本完成后，程序接收并解密 SSH 私钥到 `%USERPROFILE%\.ssh`。通常无需填写端口、服务器地址或 token。
 
 EXE 内置解密和密钥校验逻辑，不要求另外安装 Python 或 OpenSSL；网络访问和
 Cloud Studio 登录仍须由操作者提供。构建命令及高级/手动流程见
@@ -223,12 +223,17 @@ ssh -i ~/.ssh/fpro-cloudstudio -p <remote-port> root@<tunnel-host>
 无论采用哪种方式，安装末尾的端口自检仍以 TCP 端口存活为默认成功标准；设置
 `FPRO_TUNNEL_REQUIRE_SSH=1` 才会要求同时提供私钥并完成一次真实 SSH 登录。
 
-### 通过一次性 fpro 通道自动接收（推荐）
+### 通过一次性 fpro 通道接收（EXE 推荐）
 
-如果不想手动下载 `.enc` 文件，可以在操作者本机启动
-`tools/fpro_ssh_receiver.py`。它会在本机回环地址启动一次性 HTTP 接收器，
+Windows 直接运行 EXE 即可完成下面的接收器和临时代理启动；不需要手动启动
+`tools/fpro_ssh_receiver.py`。EXE 会在本机回环地址启动一次性 HTTP 接收器，
 再用临时的 fpro TCP 代理把一个未占用的远端端口转回该接收器。加密包抵达后，
-接收器在本机校验 SHA-256、SSH 指纹并解密安装私钥；解压密码从不通过网络发送。
+接收器在本机校验 token、SHA-256、SSH 指纹以及私钥/公钥匹配关系，再解密安装私钥；
+解压密码从不通过网络发送。
+
+Cloud Studio 的命令必须由操作者手动粘贴并执行。命令通过 HTTPS 获取 `install.sh`，
+脚本会提示输入与 EXE 中相同的密钥传输密码和一次性 token。EXE 的“复制一次性 token”
+按钮只在当前通道有效，接收完成或超时后通道会关闭。
 
 先在本机准备仅自己可读的 token、配置包密码和 mTLS 文件（这些文件不得提交到
 Git）：
