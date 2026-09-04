@@ -627,16 +627,21 @@ class UploadHandler(http.server.BaseHTTPRequestHandler):
             self.reject(400, "incomplete request", finish=True)
             return
 
+        # The sender must provide the digest.  Accepting an omitted header
+        # would turn the encrypted upload into a token-only transfer and
+        # would no longer satisfy the one-shot delivery contract.
         supplied_digest = self.headers.get("X-FPRO-SHA256", "").strip()
         digest = hashlib.sha256(payload).hexdigest()
-        if supplied_digest and (
+        if (
             not SHA256_RE.fullmatch(supplied_digest)
             or not hmac.compare_digest(supplied_digest.lower(), digest)
         ):
             self.reject(400, "sha256 mismatch", finish=True)
             return
-        expected_fp = self.headers.get("X-FPRO-Key-Fingerprint", "").strip() or None
-        if expected_fp and not FINGERPRINT_RE.fullmatch(expected_fp):
+        # The fingerprint is also mandatory.  It is checked again against the
+        # public key inside the decrypted archive by ``complete_install``.
+        expected_fp = self.headers.get("X-FPRO-Key-Fingerprint", "").strip()
+        if not FINGERPRINT_RE.fullmatch(expected_fp):
             self.reject(400, "invalid fingerprint", finish=True)
             return
 
@@ -790,13 +795,13 @@ def fetch_remote(args: argparse.Namespace) -> int:
                 os.fsync(output.fileno())
             announced_digest = response.headers.get("X-FPRO-SHA256", "").strip()
             actual_digest = digest.hexdigest()
-            if announced_digest and (
+            if (
                 not SHA256_RE.fullmatch(announced_digest)
                 or not hmac.compare_digest(announced_digest.lower(), actual_digest)
             ):
                 fail("收到的密钥包 SHA-256 校验失败。")
-            expected_fp = response.headers.get("X-FPRO-Key-Fingerprint", "").strip() or None
-            if expected_fp and not FINGERPRINT_RE.fullmatch(expected_fp):
+            expected_fp = response.headers.get("X-FPRO-Key-Fingerprint", "").strip()
+            if not FINGERPRINT_RE.fullmatch(expected_fp):
                 fail("远端返回的 SSH 指纹格式无效。")
             print(f"已接收加密密钥包 ({total} bytes, sha256={actual_digest})")
             fingerprint = complete_install(args, temporary, expected_fp)

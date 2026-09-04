@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  fpro 一键部署脚本 (Cloud Studio 容器侧)
+#  fpro 容器安装脚本 (Cloud Studio 容器侧)
 # ----------------------------------------------------------------------------
 #  功能：
 #   1) 提示输入压缩包解压密码（密码错误则拒绝继续，不会落地任何文件）
@@ -172,6 +172,81 @@ read_toml_scalar() {
     return 1
 }
 
+# Return the remote port belonging to the SSH proxy (container port 22).
+# fpro-client.toml may contain more than one [[proxies]] block, so reading the
+# first remotePort is unsafe: it could be a different application service.
+# Prefer the explicitly named cloudstudio-ssh block, then any block whose
+# localPort is 22.  The caller can still fall back to the legacy single-proxy
+# layout when older encrypted payloads do not include localPort metadata.
+read_ssh_proxy_remote_port() {
+    local file="$1" line key value
+    local in_proxy=0 name="" local_port="" remote_port="" first_remote=""
+
+    finish_proxy() {
+        if [ "$in_proxy" -eq 1 ] && [ "$local_port" = "22" ] \
+                && [[ "$remote_port" =~ ^[0-9]+$ ]]; then
+            if [ "$name" = "cloudstudio-ssh" ]; then
+                printf '%s\n' "$remote_port"
+                return 0
+            fi
+            [ -n "$first_remote" ] || first_remote="$remote_port"
+        fi
+        return 1
+    }
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [ -n "$line" ] || continue
+
+        if [ "$line" = "[[proxies]]" ]; then
+            if finish_proxy; then
+                return 0
+            fi
+            in_proxy=1
+            name=""
+            local_port=""
+            remote_port=""
+            continue
+        fi
+        # A different TOML table ends the current proxy block.
+        if [[ "$line" == \[*\] && "$line" != "[[proxies]]" ]]; then
+            if finish_proxy; then
+                return 0
+            fi
+            in_proxy=0
+            continue
+        fi
+        [ "$in_proxy" -eq 1 ] || continue
+        if [[ "$line" =~ ^([A-Za-z0-9_.-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+            if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+                value="${value:1:${#value}-2}"
+            elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+                value="${value:1:${#value}-2}"
+            fi
+            case "$key" in
+                name) name="$value" ;;
+                localPort) local_port="$value" ;;
+                remotePort) remote_port="$value" ;;
+            esac
+        fi
+    done < "$file"
+
+    if finish_proxy; then
+        return 0
+    fi
+    if [ -n "$first_remote" ]; then
+        printf '%s\n' "$first_remote"
+        return 0
+    fi
+    return 1
+}
+
 CLIENT_PLAIN_NAME="${FPRO_BINARY_NAME:-$(detect_client_binary)}"
 if [[ "$CLIENT_PLAIN_NAME" == *.enc ]]; then
     CLIENT_PLAIN_NAME="${CLIENT_PLAIN_NAME%.enc}"
@@ -200,7 +275,7 @@ download_artifact "$PKG_INPUT" "$PKG"
 
 # ---- 1. 输入密码 ----------------------------------------------------------
 echo "=========================================================="
-echo "  fpro 一键部署 — 请输入压缩包解压密码"
+echo "  fpro 容器安装 — 请输入配置包解密密码"
 echo "=========================================================="
 if [ -n "$PACKAGE_PASSWORD_FILE" ]; then
     [ -f "$PACKAGE_PASSWORD_FILE" ] || die "FPRO_PACKAGE_PASSWORD_FILE 不存在：$PACKAGE_PASSWORD_FILE"
@@ -681,15 +756,45 @@ mkdir -p /etc/ssh/sshd_config.d
 cp "$PAY/sshd_config.d/90-ragp.conf" /etc/ssh/sshd_config.d/90-ragp.conf
 chmod 644 /etc/ssh/sshd_config.d/90-ragp.conf
 
+# OpenSSH applies the first value it sees for most options.  A pre-existing
+# Cloud Studio drop-in can therefore win over 90-ragp.conf.  Install an early
+# managed copy as well, while retaining the documented 90-ragp.conf path for
+# compatibility with older images and audits.
+cp "$PAY/sshd_config.d/90-ragp.conf" /etc/ssh/sshd_config.d/00-fpro-cloudstudio.conf
+chmod 644 /etc/ssh/sshd_config.d/00-fpro-cloudstudio.conf
+
 mkdir -p /run/sshd
 if ! "$SSHD_BIN" -t; then
     echo "[-] sshd 配置校验失败，未启动 sshd。" >&2
     exit 1
 fi
+effective_sshd_config="$($SSHD_BIN -T 2>/dev/null || true)"
+if ! grep -Fxq "passwordauthentication no" <<< "$effective_sshd_config"; then
+    echo "[-] sshd 生效配置仍允许密码登录，已中止。" >&2
+    exit 1
+fi
+if ! grep -Eq '^permitrootlogin (prohibit-password|without-password)$' <<< "$effective_sshd_config"; then
+    echo "[-] sshd 生效配置未允许 root 密钥登录，已中止。" >&2
+    exit 1
+fi
 if ! pgrep -x sshd >/dev/null 2>&1; then
-    "$SSHD_BIN" && echo "[+] sshd 已启动" || echo "[!] sshd 启动失败，请检查 sshd 配置"
+    if "$SSHD_BIN"; then
+        echo "[+] sshd 已启动"
+    else
+        echo "[-] sshd 启动失败，请检查 sshd 配置。" >&2
+        exit 1
+    fi
 else
-    echo "[+] sshd 已在运行"
+    # A running daemon does not reread drop-ins until it receives HUP.  Reload
+    # the oldest sshd (normally the master) so the new authorized_keys and
+    # password policy apply without dropping existing Cloud Studio sessions.
+    sshd_master="$(pgrep -xo sshd || true)"
+    if [ -n "$sshd_master" ] && kill -HUP "$sshd_master" 2>/dev/null; then
+        echo "[+] sshd 已在运行并重新加载配置"
+    else
+        echo "[-] sshd 已在运行，但无法重新加载配置。" >&2
+        exit 1
+    fi
 fi
 
 echo "[+] root SSH 公钥指纹: $SSH_KEY_FINGERPRINT"
@@ -729,11 +834,25 @@ else
 fi
 
 # 回环验证所需的地址和端口从解密后的客户端配置读取，避免写入仓库明文。
+# 端口优先取 localPort=22 的 SSH proxy，而不是配置中可能存在的其他
+# remotePort；这样“端口存活”明确对应容器 SSH 服务。
 TUNNEL_HOST="${FPRO_TUNNEL_HOST:-$(read_toml_scalar serverAddr "$PAY/fpro-client.toml" || true)}"
-TUNNEL_PORT="${FPRO_TUNNEL_PORT:-$(read_toml_scalar remotePort "$PAY/fpro-client.toml" || true)}"
+if [ -n "${FPRO_TUNNEL_PORT:-}" ]; then
+    TUNNEL_PORT="$FPRO_TUNNEL_PORT"
+else
+    TUNNEL_PORT="$(read_ssh_proxy_remote_port "$PAY/fpro-client.toml" || true)"
+    if [ -z "$TUNNEL_PORT" ]; then
+        # Legacy payload fallback: a single top-level remotePort was used by
+        # early releases.  Keep it working, but make the assumption visible.
+        TUNNEL_PORT="$(read_toml_scalar remotePort "$PAY/fpro-client.toml" || true)"
+        [ -n "$TUNNEL_PORT" ] && echo "[!] 未找到 localPort=22 的 proxy，使用旧版 remotePort。" >&2
+    fi
+fi
 [ -n "$TUNNEL_HOST" ] || die "无法从加密配置读取 serverAddr。"
-[[ "$TUNNEL_PORT" =~ ^[0-9]+$ ]] || die "无法从加密配置读取有效的 remotePort。"
+[[ "$TUNNEL_PORT" =~ ^[0-9]+$ ]] || die "无法从加密配置读取有效的 SSH 映射 remotePort。"
+(( TUNNEL_PORT >= 1 && TUNNEL_PORT <= 65535 )) || die "SSH 映射 remotePort 超出 1-65535 范围。"
 [[ "$TUNNEL_HOST" =~ ^[A-Za-z0-9._:-]+$ ]] || die "加密配置中的 serverAddr 格式无效。"
+echo "[*] SSH 映射：容器 22 -> $TUNNEL_HOST:$TUNNEL_PORT"
 
 # 端口探测是默认成功标准：映射未建立时，frps 的远端端口应不会响应。
 # 优先使用 nc；没有 nc 时使用 timeout + Bash /dev/tcp；两者都没有时，

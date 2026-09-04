@@ -1,4 +1,4 @@
-# fpro 一键重装部署方案（Cloud Studio 容器）
+# fpro 重装部署方案（Cloud Studio 容器）
 
 ## 作用
 
@@ -300,8 +300,8 @@ python tools/fpro_ssh_receiver.py decrypt \
   --ssh-dir ~/.ssh
 ```
 
-接收器默认只绑定 `127.0.0.1`，使用一次性随机 token、大小限制、路径穿越/软链接
-检查、私钥与 `.pub` 匹配检查以及原子写入。只有明确指定 `--allow-public` 才会
+接收器默认只绑定 `127.0.0.1`，使用一次性随机 token、必需的 SHA-256 与 SSH 指纹
+头、大小限制、路径穿越/软链接检查、私钥与 `.pub` 匹配检查以及原子写入。只有明确指定 `--allow-public` 才会
 允许监听非回环地址；即使如此，仍应依赖 fpro TLS、随机 token 和加密包密码共同
 保护传输。
 
