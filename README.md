@@ -220,8 +220,8 @@ ssh -i ~/.ssh/fpro-cloudstudio -p <remote-port> root@<tunnel-host>
 `FPRO_SSH_EXPORT=1 FPRO_SSH_PRIVATE_KEY=/path/to/key`；脚本仍会先检查公钥
 指纹，且不会打印私钥内容。
 
-无论采用哪种方式，安装末尾的端口自检仍以 TCP 端口存活为默认成功标准；设置
-`FPRO_TUNNEL_REQUIRE_SSH=1` 才会要求同时提供私钥并完成一次真实 SSH 登录。
+无论采用哪种方式，安装末尾的端口自检仍以 TCP 端口存活为默认成功标准；只有
+显式提供 `FPRO_TUNNEL_SSH_KEY` 或设置 `FPRO_TUNNEL_REQUIRE_SSH=1`，才会追加真实 SSH 登录验证。
 
 ### 通过一次性 fpro 通道接收（EXE 推荐）
 
