@@ -326,20 +326,23 @@ def make_remote_command(
     )
     return (
         "set -o pipefail; umask 077; "
+        "FPRO_PW_FILE=\"$(mktemp)\" || exit 1; "
+        "FPRO_TOKEN_FILE=\"$(mktemp)\" || { rm -f -- \"$FPRO_PW_FILE\"; exit 1; }; "
+        "trap 'rm -f -- \"$FPRO_PW_FILE\" \"$FPRO_TOKEN_FILE\"' EXIT HUP INT TERM; "
         "printf '\\n密钥传输密码（配置包密码）: '; read -r -s FPRO_PACKAGE_PASSWORD; "
-        "printf '%s' \"$FPRO_PACKAGE_PASSWORD\" >/tmp/fpro-package-password; "
+        "printf '%s' \"$FPRO_PACKAGE_PASSWORD\" >\"$FPRO_PW_FILE\"; "
         "unset FPRO_PACKAGE_PASSWORD; "
         "printf '\\n一次性接收 token: '; read -r -s FPRO_TRANSFER_TOKEN; "
-        "printf '%s\\n' \"$FPRO_TRANSFER_TOKEN\" >/tmp/fpro-receiver-token; "
+        "printf '%s\\n' \"$FPRO_TRANSFER_TOKEN\" >\"$FPRO_TOKEN_FILE\"; "
         "unset FPRO_TRANSFER_TOKEN; "
         f"{fetch_script} | sudo env "
-        "FPRO_PACKAGE_PASSWORD_FILE=/tmp/fpro-package-password "
+        "FPRO_PACKAGE_PASSWORD_FILE=\"$FPRO_PW_FILE\" "
         "FPRO_SSH_GENERATE=1 "
         f"FPRO_SSH_KEY_NAME={shell_quote(key_name)} "
         f"FPRO_SSH_RECEIVER_URL={shell_quote(receiver_url)} "
-        "FPRO_SSH_RECEIVER_TOKEN_FILE=/tmp/fpro-receiver-token "
+        "FPRO_SSH_RECEIVER_TOKEN_FILE=\"$FPRO_TOKEN_FILE\" "
         "FPRO_SSH_RECEIVER_TIMEOUT=90 bash; "
-        "rc=$?; rm -f /tmp/fpro-package-password /tmp/fpro-receiver-token; exit $rc"
+        "rc=$?; exit $rc"
     )
 
 
@@ -969,6 +972,8 @@ def self_test() -> int:
     command = make_remote_command(DEFAULT_RAW_BASE, "http://example.invalid:12345/v1/ssh-key")
     assert "FPRO_SSH_RECEIVER_TOKEN_FILE" in command
     assert "FPRO_PACKAGE_PASSWORD_FILE" in command
+    assert "mktemp" in command and "trap 'rm -f" in command
+    assert "automate_cloudstudio" not in command
     assert "example.invalid" in command
     named_command = make_remote_command(
         DEFAULT_RAW_BASE,
