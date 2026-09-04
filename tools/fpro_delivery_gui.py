@@ -678,10 +678,25 @@ class DeliveryApp(tk.Tk):
                 elif event == "ready":
                     self.on_proxy_ready()
                 elif event == "command_preview":
-                    # The endpoint is known while the worker is coming up;
-                    # show the command early so it never has to be retyped.
-                    if self.prepared is not None:
-                        self.set_command_preview(str(value))
+                    # The receiver URL and one-shot token are known before the
+                    # fpro child has finished its health check.  Publish both
+                    # on the Tk thread so the copy buttons are usable while
+                    # the tunnel is still coming up (and do not remain grey
+                    # forever if a legacy client does not emit READY_MARKER).
+                    if isinstance(value, dict):
+                        self.current_url = str(value.get("url", ""))
+                        self.current_command = str(value.get("command", ""))
+                        self.current_token = str(value.get("token", ""))
+                        if self.current_command:
+                            self.set_command_preview(self.current_command)
+                        self.show_command_controls()
+                        self.status_var.set("正在建立一次性 fpro 通道；命令和 token 已可复制")
+                    elif self.prepared is not None:
+                        # Keep accepting the old string payload for callers
+                        # and test harnesses that only provide a preview text.
+                        self.current_command = str(value)
+                        self.set_command_preview(self.current_command)
+                        self.show_command_controls()
                 elif event == "done":
                     self.on_worker_done(int(value))
                 elif event == "error":
@@ -841,11 +856,15 @@ class DeliveryApp(tk.Tk):
                 raw_base=options.raw_base,
             )
             self.prepared = assets
-            self.current_token = receiver_token_value
             preview_url = f"http://{url_host(server_addr)}:{temp_port}/v1/ssh-key"
+            preview_command = make_remote_command(options.raw_base, preview_url, options.key_name)
             self.post(
                 "command_preview",
-                make_remote_command(options.raw_base, preview_url, options.key_name),
+                {
+                    "url": preview_url,
+                    "command": preview_command,
+                    "token": receiver_token_value,
+                },
             )
             self.post("set", ("server", server_addr))
             self.post("set", ("server_port", str(server_port)))
